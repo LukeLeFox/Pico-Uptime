@@ -91,8 +91,9 @@ CONFIG = {
     "WIFI_PASSWORD": "LaTuaPassword",
     ...
 }
-Genera hash SHA256 della password
 
+
+Genera hash SHA256 della password
 python - <<'PY'
 import hashlib; print(hashlib.sha256(b"tuaPassword").hexdigest())
 PY
