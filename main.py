@@ -4,6 +4,8 @@
 # - Notifiche Telegram su variazioni UP/DOWN
 # - Soglie e intervallo configurabili da UI (persistenti)
 # - Notifiche silenziose/sonore per-target + pagina test notifiche
+# - Config Telegram da UI (telegram.json) + toggle ON/OFF
+# - Reboot da UI
 # - Auto-reboot se Wi-Fi non torna dopo N tentativi
 
 import network, time, socket, ssl, json, os, gc, machine
@@ -26,8 +28,9 @@ LED = machine.Pin("LED", machine.Pin.OUT)
 # ======= CONFIG ========
 # =======================
 CONFIG = {
-    "WIFI_SSID": "Inserisci il tuo SSID",
-    "WIFI_PASSWORD": "inserisci la tua PSW",
+    "WIFI_SSID": "placeholder_ssid",
+    "WIFI_PASSWORD": "placeholder_netpsw",
+
 
     "HTTP_PORT": 8080,
 
@@ -37,8 +40,8 @@ CONFIG = {
     
     #default conf telegram here
     "TELEGRAM_ENABLED": True,
-    "TELEGRAM_BOT_TOKEN": "inserisci il token del tuo bot",
-    "TELEGRAM_CHAT_ID": "inserisci il tuo chat id",
+    "TELEGRAM_BOT_TOKEN": "placeholder_token",
+    "TELEGRAM_CHAT_ID": "placeholder_id",
     
     "TARGETS_FILE": "targets.json",
 }
@@ -50,12 +53,13 @@ CONFIG = {
 #   PY
 AUTH = {
     "USER": "admin",
-    "PASS_SHA256": "sha256psw",
+    "PASS_SHA256": "placeholder_psw",
     "MAX_FAILS": 5,
     "BLOCK_SECONDS": 30,
     "HEALTH_PUBLIC_TOKEN": "",  # opzionale per /health senza auth
 }
 
+# === FILE DI CONFIG ===
 CONFIG_FILE = "config.json"
 TELEGRAM_CONFIG_FILE = "telegram.json"
 
@@ -63,30 +67,42 @@ TELEGRAM_CONFIG_FILE = "telegram.json"
 # == RUNTIME CONFIG IO ==
 # =======================
 def load_runtime_config():
+    """Carica parametri runtime da config.json (se esiste)."""
     try:
         if CONFIG_FILE in os.listdir():
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
+
             ci = int(data.get("CHECK_INTERVAL", CONFIG["CHECK_INTERVAL"]))
-            up = int(data.get("UP_THRESHOLD",   CONFIG["UP_THRESHOLD"]))
+            up = int(data.get("UP_THRESHOLD", CONFIG["UP_THRESHOLD"]))
             dn = int(data.get("DOWN_THRESHOLD", CONFIG["DOWN_THRESHOLD"]))
-            CONFIG["CHECK_INTERVAL"] = max(5, min(ci, 3600))
-            CONFIG["UP_THRESHOLD"]   = max(1, min(up, 10))
-            CONFIG["DOWN_THRESHOLD"] = max(1, min(dn, 10))
-            print("[CFG] runtime loaded:", CONFIG["CHECK_INTERVAL"],
-                  CONFIG["UP_THRESHOLD"], CONFIG["DOWN_THRESHOLD"])
+
+            # limiti di sicurezza
+            ci = max(2, min(ci, 600))
+            up = max(1, min(up, 10))
+            dn = max(1, min(dn, 10))
+
+            CONFIG["CHECK_INTERVAL"] = ci
+            CONFIG["UP_THRESHOLD"] = up
+            CONFIG["DOWN_THRESHOLD"] = dn
+            print("[CFG] runtime loaded:", ci, up, dn) #<- Commenta per debug
+        else:
+            print("[CFG] no config file found, using defaults")
     except Exception as e:
         print("[CFG] load error:", repr(e))
 
+
 def save_runtime_config():
+    """Salva i parametri runtime nel file config.json."""
     try:
         data = {
             "CHECK_INTERVAL": CONFIG["CHECK_INTERVAL"],
-            "UP_THRESHOLD":   CONFIG["UP_THRESHOLD"],
+            "UP_THRESHOLD": CONFIG["UP_THRESHOLD"],
             "DOWN_THRESHOLD": CONFIG["DOWN_THRESHOLD"],
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f)
+        print("[CFG] saved to file") #<- Commenta per debug
         return True
     except Exception as e:
         print("[CFG] save error:", repr(e))
@@ -106,7 +122,7 @@ def load_telegram_config():
                 CONFIG["TELEGRAM_BOT_TOKEN"] = data["TELEGRAM_BOT_TOKEN"]
             if "TELEGRAM_CHAT_ID" in data and data["TELEGRAM_CHAT_ID"]:
                 CONFIG["TELEGRAM_CHAT_ID"] = str(data["TELEGRAM_CHAT_ID"])
-            print("[TGCFG] loaded from file")
+            print("[TGCFG] loaded from file") #<- Commenta per debug
         else:
             save_telegram_config()
     except Exception as e:
@@ -131,41 +147,36 @@ def save_telegram_config():
 # =======================
 def load_targets():
     fname = CONFIG["TARGETS_FILE"]
-    if fname in os.listdir():
-        try:
+    data = []  # <- INIZIALIZZA SEMPRE con lista vuota
+    
+    try:
+        if fname in os.listdir():
             with open(fname, "r") as f:
                 data = json.load(f)
-            out = []
-            for t in data:
-                mode = t.get("mode")
-                name = t.get("name", "target")
-                silent = bool(t.get("silent", False))
-                if mode == "http" and t.get("url"):
-                    out.append({
-                        "name": name,
-                        "mode": "http",
-                        "url": t["url"],
-                        "silent": silent
-                    })
-                elif mode == "tcp" and t.get("host") and int(t.get("port", 0)) > 0:
-                    out.append({
-                        "name": name,
-                        "mode": "tcp",
-                        "host": t["host"],
-                        "port": int(t["port"]),
-                        "silent": silent
-                    })
-                elif mode == "ping" and t.get("host"):
-                    out.append({
-                        "name": name,
-                        "mode": "ping",
-                        "host": t["host"],
-                        "silent": silent
-                    })
-            return out
-        except Exception as e:
-            print("[TARGET] load error:", repr(e))
-    return []
+                # se il file contenesse "null" o roba strana, forziamo lista
+                if not isinstance(data, list):
+                    data = []
+        else:
+            data = []
+    except Exception as e:
+        print("[CFG] load_targets error:", repr(e))
+        data = []
+
+    out = []
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        mode  = t.get("mode")
+        name  = t.get("name", "target")
+        silent = bool(t.get("silent", False))
+        if mode == "http" and t.get("url"):
+            out.append({"name": name, "mode": "http", "url": t["url"], "silent": silent})
+        elif mode == "tcp" and t.get("host") and int(t.get("port", 0)) > 0:
+            out.append({"name": name, "mode": "tcp", "host": t["host"], "port": int(t["port"]), "silent": silent})
+        elif mode == "ping" and t.get("host"):
+            out.append({"name": name, "mode": "ping", "host": t["host"], "silent": silent})
+
+    return out  # SEMPRE restituisce una lista (anche se vuota)
 
 def save_targets(targets):
     try:
@@ -411,17 +422,12 @@ def telegram_send(bot_token, chat_id, text, silent=False):
             pass
 
 def notify(text, silent=False):
-    if (
-        CONFIG.get("TELEGRAM_ENABLED")
-        and CONFIG.get("TELEGRAM_BOT_TOKEN")
-        and CONFIG.get("TELEGRAM_CHAT_ID")
-    ):
-        telegram_send(
-            CONFIG["TELEGRAM_BOT_TOKEN"],
-            CONFIG["TELEGRAM_CHAT_ID"],
-            text,
-            silent=silent
-        )
+    if not CONFIG.get("TELEGRAM_ENABLED"):
+        return
+    try:
+        telegram_send(CONFIG["TELEGRAM_BOT_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"], text, silent=silent)
+    except Exception as e:
+        print("[TG] notify error:", repr(e))
 
 # =======================
 # ====== BASIC AUTH =====
@@ -498,33 +504,51 @@ def http_response(conn, status="200 OK", ctype="text/html; charset=utf-8", body=
 # ======= WEB UI ========
 # =======================
 def render_page(targets, states, flash=""):
+    if targets is None:
+        targets = []
+    if states is None:
+        states = []
+    # costruzione righe tabella
     rows = []
     for i, t in enumerate(targets):
-        st = states[i]["status"] if i < len(states) else None
+        st   = states[i]["status"] if i < len(states) else None
         code = states[i].get("last_code") if i < len(states) else None
 
-        badge = "⚪ unknown"
-        if t["mode"] == "ping":
+        # badge stato
+        if t.get("mode") == "ping":
             if st is True:
                 badge = "🟢 UP" + ("" if code is None else " ({} ms)".format(code))
             elif st is False:
                 badge = "🔴 DOWN (ping)"
+            else:
+                badge = "⚪ unknown"
         else:
             if st is True:
                 badge = "🟢 UP"
             elif st is False:
                 badge = "🔴 DOWN" + ("" if code is None else " (HTTP {})".format(code))
+            else:
+                badge = "⚪ unknown"
 
-        if t["mode"] == "http":
-            desc = html_escape(t["url"])
-        elif t["mode"] == "tcp":
-            desc = "{}:{}".format(html_escape(t["host"]), t["port"])
+        # endpoint leggibile
+        if t.get("mode") == "http":
+            endpoint = html_escape(t.get("url",""))
+        elif t.get("mode") == "tcp":
+            endpoint = "{}:{}".format(html_escape(t.get("host","")), t.get("port",""))
         else:  # ping
-            desc = "{} (ICMP)".format(html_escape(t["host"]))
+            endpoint = "{} (ICMP)".format(html_escape(t.get("host","")))
 
-        silent = bool(t.get("silent", False))
-        notif_label = "🔕 silenziose" if silent else "🔔 sonore"
-        notif_link = "<a href='/notifymode?i={}'>cambia</a>".format(i)
+        # stato notifica (supporta sia 'silent' sia 'mute' per retrocompatibilità)
+        is_silent = bool(t.get("silent", t.get("mute", False)))
+        notif_html = (
+            "<a href='/notifymode?i={}'>🔊 Sonoro</a> | <span style='opacity:.5'>🔕 Silenzioso</span>"
+            if is_silent else
+            "<span style='opacity:.5'>🔊 Sonoro</span> | <a href='/notifymode?i={}'>🔕 Silenzioso</a>"
+        ).format(i)
+
+
+        # azioni
+        actions = "<a href='/test?i={}'>Test</a> | <a href='/del?i={}' onclick='return confirm(\"Eliminare?\")'>Del</a>".format(i, i)
 
         rows.append(
             "<tr>"
@@ -532,156 +556,175 @@ def render_page(targets, states, flash=""):
             "<td>{}</td>"
             "<td><code>{}</code></td>"
             "<td style='text-align:center'>{}</td>"
-            "<td style='text-align:center'>{}<br>{}</td>"
-            "<td style='text-align:right'>"
-            "<a href='/test?i={}'>Test</a> | "
-            "<a href='/del?i={}' onclick='return confirm(\"Eliminare?\")'>Del</a>"
-            "</td>"
+            "<td style='text-align:center'>{}</td>"
+            "<td style='text-align:right'>{}</td>"
             "</tr>".format(
-                html_escape(t.get("name", "target")),
-                html_escape(t["mode"]),
-                desc,
+                html_escape(t.get("name","target")),
+                html_escape(t.get("mode","-")),
+                endpoint,
                 badge,
-                notif_label,
-                notif_link,
-                i,
-                i
+                notif_html,
+                actions
             )
         )
 
     flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
 
-    tg_status = "🟢 ON" if CONFIG.get("TELEGRAM_ENABLED") else "🔴 OFF"
-    tok = CONFIG.get("TELEGRAM_BOT_TOKEN") or ""
-    if len(tok) > 8:
-        tok_disp = tok[:4] + "..." + tok[-4:]
-    elif tok:
-        tok_disp = "(impostato)"
-    else:
-        tok_disp = "(non impostato)"
-
+    # pagina
     html = """<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<title>Pico Uptime</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;}}
-table{{width:100%%;border-collapse:collapse;margin:12px 0;}}
-th,td{{border:1px solid #ddd;padding:8px;}}
-th{{background:#f2f2f2;text-align:left;}}
-fieldset{{margin-top:16px;border:1px solid #ddd;}}
-legend{{padding:0 6px;color:#444}}
-input,select{{padding:6px;margin:4px 0;min-width:220px;}}
-.btn{{display:inline-block;padding:8px 12px;border:1px solid #444;background:#fafafa;cursor:pointer;text-decoration:none}}
-.btn-red{{border-color:#c00;color:#c00}}
-.flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
-.small{{color:#666;font-size:12px}}
-</style>
-</head><body>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Pico Uptime</title>
+  <style>
+    body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:980px;margin:28px auto;padding:0 12px;}}
+    h1{{display:flex;align-items:center;gap:8px}}
+    table{{width:100%%;border-collapse:collapse;margin:14px 0;}}
+    th,td{{border:1px solid #ddd;padding:8px;}}
+    th{{background:#f6f6f6;text-align:left;}}
+    fieldset{{margin-top:16px;border:1px solid #ddd;}}
+    legend{{padding:0 6px;color:#444}}
+    input,select{{padding:6px;margin:4px 0;min-width:260px;}}
+    .btn{{display:inline-block;padding:8px 12px;border:1px solid #444;background:#fafafa;cursor:pointer;text-decoration:none}}
+    .flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
+    .small{{color:#666;font-size:12px}}
+  </style>
+</head>
+<body>
+
 <h1>🧭 Pico Uptime</h1>
-<p class="small">UI protetta da Basic Auth. Notifiche Telegram solo su variazione UP/DOWN.</p>
+<p class="small">UI protetta da Basic Auth. Notifiche Telegram solo su variazione UP/DOWN. Colonna “Notifica” per Sonoro/Silenzioso per-target.</p>
 {flash}
 
 <table>
-<thead>
-<tr>
-  <th>Nome</th>
-  <th>Modo</th>
-  <th>Endpoint</th>
-  <th>Stato</th>
-  <th>Notifiche</th>
-  <th style='text-align:right'>Azioni</th>
-</tr>
-</thead>
-<tbody>
-{rows}
-</tbody>
+  <thead>
+    <tr>
+      <th>Nome</th>
+      <th>Modo</th>
+      <th>Endpoint</th>
+      <th>Stato</th>
+      <th>Notifica</th>
+      <th style="text-align:right">Azioni</th>
+    </tr>
+  </thead>
+  <tbody>
+    {rows}
+  </tbody>
 </table>
 
 <fieldset>
-<legend>Aggiungi target</legend>
-<form action="/add" method="get">
-  <label>Nome<br><input type="text" name="name" placeholder="NAS HTTP"></label><br>
-  <label>Modo<br>
-    <select name="mode" id="mode" onchange="onModeChange(this.value)">
-      <option value="http">http/https</option>
-      <option value="tcp">tcp</option>
-      <option value="ping">ping (ICMP)</option>
-    </select>
-  </label><br>
-  <div id="httpFields">
-    <label>URL<br><input type="text" name="url" placeholder="http://192.168.1.10/"></label><br>
-  </div>
-  <div id="hostFields" style="display:none">
-    <label>Host<br><input type="text" name="host" placeholder="192.168.1.20"></label><br>
-  </div>
-  <div id="portField" style="display:none">
-    <label>Porta<br><input type="number" name="port" placeholder="1883"></label><br>
-  </div>
-  <button class="btn" type="submit">Aggiungi</button>
-</form>
+  <legend>Aggiungi target</legend>
+  <form action="/add" method="get" id="addForm">
+    <label>Nome<br>
+      <input type="text" name="name" placeholder="NAS HTTP">
+    </label><br>
+
+    <label>Modo<br>
+      <select name="mode" id="mode" onchange="onModeChange(this.value)">
+        <option value="http">http/https</option>
+        <option value="tcp">tcp</option>
+        <option value="ping">ping (ICMP)</option>
+      </select>
+    </label><br>
+
+    <!-- HTTP/HTTPS -->
+    <div id="httpFields">
+      <label>URL<br>
+        <input type="text" name="url" placeholder="http://10.10.99.253/">
+      </label><br>
+    </div>
+
+    <!-- TCP -->
+    <div id="tcpFields" style="display:none">
+      <label>Host<br>
+        <input type="text" name="host" placeholder="10.10.99.254">
+      </label><br>
+      <label>Porta<br>
+        <input type="number" name="port" placeholder="1883" min="1" max="65535" step="1">
+      </label><br>
+    </div>
+
+    <!-- PING -->
+    <div id="pingFields" style="display:none">
+      <label>Host<br>
+        <input type="text" name="host_ping" placeholder="10.10.99.254">
+      </label><br>
+    </div>
+
+    <button class="btn" type="submit">Aggiungi</button>
+  </form>
 </fieldset>
 
-<fieldset>
-<legend>Impostazioni</legend>
-<form action="/set" method="get">
-  <label>Intervallo polling (s)<br>
-    <input type="number" name="ci" min="5" max="3600" value="{ci}">
-  </label><br>
-  <label>Soglia UP (OK consecutivi)<br>
-    <input type="number" name="up" min="1" max="10" value="{up}">
-  </label><br>
-  <label>Soglia DOWN (KO consecutivi)<br>
-    <input type="number" name="dn" min="1" max="10" value="{dn}">
-  </label><br>
-  <button class="btn" type="submit">Salva</button>
-</form>
-<p class="small">Valori consigliati: intervallo 15–60s, soglie 1–3.</p>
-</fieldset>
+<script>
+function onModeChange(v){{    // <-- graffe raddoppiate
+  var http = document.getElementById('httpFields');
+  var tcp  = document.getElementById('tcpFields');
+  var ping = document.getElementById('pingFields');
 
-<fieldset>
-<legend>Telegram</legend>
+  // toggle visibilità
+  http.style.display = (v === 'http') ? 'block' : 'none';
+  tcp.style.display  = (v === 'tcp')  ? 'block' : 'none';
+  ping.style.display = (v === 'ping') ? 'block' : 'none';
+
+  // abilita/disabilita i campi per evitare submit indesiderati
+  Array.from(http.querySelectorAll('input')).forEach(function(el){{ el.disabled = (v !== 'http'); }});
+  Array.from(tcp.querySelectorAll('input')).forEach(function(el){{ el.disabled  = (v !== 'tcp'); }});
+  Array.from(ping.querySelectorAll('input')).forEach(function(el){{ el.disabled = (v !== 'ping'); }});
+
+  // mappa host ping -> name=host solo quando serve
+  var hostPing = document.querySelector('input[name="host_ping"]');
+  if (v === 'ping') {{ hostPing.setAttribute('name','host'); }}
+  else             {{ hostPing.setAttribute('name','host_ping'); }}
+}}
+
+// inizializza allo stato corrente del select
+window.addEventListener('DOMContentLoaded', function(){{ 
+  onModeChange(document.getElementById('mode').value); 
+}});
+</script>
+
+
 <p class="small">
-Stato: <b>{tg_status}</b><br>
-Token: {tok_disp}<br>
-Chat ID: {chatid}
+  Config: <a href="/telegram">/telegram</a> ·
+  Test notifiche: <a href="/notify_test">/notify_test</a> ·
+  Sistema: <a href="/reboot" onclick="return confirm('Riavviare il dispositivo?')">riavvia</a>
 </p>
-<p>
-  <a class="btn" href="/tg_toggle">Toggle ON/OFF</a>
-  <a class="btn" href="/telegram">Config Telegram…</a>
-  <a class="btn" href="/notify_test">Test notifiche</a>
-</p>
-</fieldset>
 
-<p>
-  <a class="btn btn-red" href="/reboot" onclick="return confirm('Riavviare il Pico?');">♻️ Reboot Pico</a>
+<p class="small">
+Polling: ogni {ci}s — UP thr {up} / DOWN thr {dn}.
+<a href="/settings">Modifica</a>
 </p>
 
 <script>
-function onModeChange(v){{
-  document.getElementById('httpFields').style.display = (v==='http')?'block':'none';
-  document.getElementById('hostFields').style.display = (v==='tcp' || v==='ping')?'block':'none';
-  document.getElementById('portField').style.display = (v==='tcp')?'block':'none';
+function onModeChange(v){{   // doppie graffe per .format
+  document.getElementById('httpFields').style.display = (v==='http') ? 'block' : 'none';
+  document.getElementById('hostFields').style.display = (v==='tcp' || v==='ping') ? 'block' : 'none';
+  document.getElementById('portField').style.display = (v==='tcp') ? 'block' : 'none';
 }}
+// init on load
+(function(){{ 
+  var sel = document.getElementById('mode');
+  if (sel) onModeChange(sel.value);
+}})();
 </script>
 
-</body></html>
+</body>
+</html>
 """.format(
-        flash=flash_html,
-        rows="\n".join(rows),
-        ci=CONFIG["CHECK_INTERVAL"],
-        up=CONFIG["UP_THRESHOLD"],
-        dn=CONFIG["DOWN_THRESHOLD"],
-        tg_status=tg_status,
-        tok_disp=html_escape(tok_disp),
-        chatid=html_escape(str(CONFIG.get("TELEGRAM_CHAT_ID") or "(non impostato)")),
-    )
+    flash=flash_html,
+    rows="\n".join(rows),
+    ci=CONFIG["CHECK_INTERVAL"],
+    up=CONFIG["UP_THRESHOLD"],
+    dn=CONFIG["DOWN_THRESHOLD"]
+)
 
     return html
 
 def render_notify_test_page(targets, flash=""):
+    if targets is None:
+        targets = []
     rows = []
-    for i, t in enumerate(targets):
+    for i, t in enumerate(targets or []):
         silent = bool(t.get("silent", False))
         mode_label = "🔕 silenziose" if silent else "🔔 sonore"
         rows.append(
@@ -694,15 +737,13 @@ def render_notify_test_page(targets, flash=""):
             "</td>"
             "</tr>".format(
                 html_escape(t.get("name", "target")),
-                mode_label,
-                i, i
+                mode_label, i, i
             )
         )
     flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
-    html = """<!doctype html>
+    return """<!doctype html>
 <html><head>
-<meta charset="utf-8">
-<title>Test notifiche - Pico Uptime</title>
+<meta charset="utf-8"><title>Test notifiche - Pico Uptime</title>
 <style>
 body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;}}
 table{{width:100%%;border-collapse:collapse;margin:12px 0;}}
@@ -724,7 +765,43 @@ th{{background:#f2f2f2;text-align:left;}}
 <p class="small"><a href="/">← Torna alla dashboard</a></p>
 </body></html>
 """.format(flash=flash_html, rows="\n".join(rows))
-    return html
+
+def render_settings_page(flash=""):
+    flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
+    return """<!doctype html>
+<html><head><meta charset="utf-8"><title>Impostazioni</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;}}
+fieldset{{border:1px solid #ddd;}}
+legend{{padding:0 6px;color:#444}}
+label{{display:block;margin:8px 0 4px}}
+input{{padding:6px;min-width:160px}}
+.btn{{display:inline-block;padding:8px 12px;border:1px solid #444;background:#fafafa;cursor:pointer;text-decoration:none}}
+.flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
+.small{{color:#666;font-size:12px}}
+</style>
+</head><body>
+<h2>⚙️ Impostazioni runtime</h2>
+{flash}
+<form action="/settings" method="get">
+  <fieldset>
+    <legend>Polling & Soglie</legend>
+    <label>Intervallo di polling (secondi)</label>
+    <input type="number" name="ci" min="2" max="600" value="{ci}">
+    <label>UP_THRESHOLD (conteggi)</label>
+    <input type="number" name="up" min="1" max="10" value="{up}">
+    <label>DOWN_THRESHOLD (conteggi)</label>
+    <input type="number" name="dn" min="1" max="10" value="{dn}">
+  </fieldset>
+  <p style="margin-top:12px">
+    <button class="btn" type="submit" name="save" value="1">Salva</button>
+    <a class="btn" href="/">Annulla</a>
+  </p>
+</form>
+<p class="small">Le modifiche vengono salvate in <code>config.json</code> e applicate al volo.</p>
+</body></html>
+""".format(flash=flash_html, ci=CONFIG["CHECK_INTERVAL"], up=CONFIG["UP_THRESHOLD"], dn=CONFIG["DOWN_THRESHOLD"])
+
 
 def render_telegram_page(flash=""):
     flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
@@ -789,7 +866,7 @@ def ensure_server_socket():
         s.listen(2)
         s.settimeout(0.2)
         SERVER_SOCK = s
-        print("[HTTP] listening on port", port)
+        print("[HTTP] listening on port", port) #<- Commenta per debug
         return True
     except Exception as e:
         print("[HTTP] create socket error:", repr(e))
@@ -856,20 +933,31 @@ def serve_once(targets, states):
                 )
             return False
 
-        # ===== Routing =====
+        # --- ignora favicon per evitare richieste spurie ---
+        if path == "/favicon.ico":
+            http_response(conn, "204 No Content", body="")
+            conn.close()
+            return targets, states
 
+        # ================== ROUTING ==================
         if path == "/":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
+            if targets is None: targets = []
+            if states is None: states = []
             http_response(conn, body=render_page(targets, states, ""))
+            conn.close()
+            return targets, states
 
         elif path == "/add":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
-            name = params.get("name", "").strip() or "target"
-            mode = params.get("mode", "http")
+            if not isinstance(targets, list):
+                targets = []
+            name = params.get("name","").strip() or "target"
+            mode = params.get("mode","http")
             if mode == "http":
-                url = params.get("url", "").strip()
+                url = params.get("url","").strip()
                 if url:
                     targets.append({"name": name, "mode": "http", "url": url, "silent": False})
                     save_targets(targets)
@@ -878,8 +966,8 @@ def serve_once(targets, states):
                 else:
                     flash = "URL mancante."
             elif mode == "tcp":
-                host = params.get("host", "").strip()
-                port = int(params.get("port", "0") or "0")
+                host = params.get("host","").strip()
+                port = int(params.get("port","0") or "0")
                 if host and port > 0:
                     targets.append({"name": name, "mode": "tcp", "host": host, "port": port, "silent": False})
                     save_targets(targets)
@@ -888,7 +976,7 @@ def serve_once(targets, states):
                 else:
                     flash = "Host/Porta mancanti."
             elif mode == "ping":
-                host = params.get("host", "").strip()
+                host = params.get("host","").strip()
                 if host:
                     targets.append({"name": name, "mode": "ping", "host": host, "silent": False})
                     save_targets(targets)
@@ -899,6 +987,7 @@ def serve_once(targets, states):
             else:
                 flash = "Modo non valido."
             http_response(conn, body=render_page(targets, states, flash))
+            conn.close(); return targets, states
 
         elif path == "/del":
             if not require_auth_or_deny():
@@ -913,6 +1002,7 @@ def serve_once(targets, states):
             else:
                 flash = "Indice non valido."
             http_response(conn, body=render_page(targets, states, flash))
+            conn.close(); return targets, states
 
         elif path == "/test":
             if not require_auth_or_deny():
@@ -920,16 +1010,14 @@ def serve_once(targets, states):
             i = int(params.get("i", "-1") or "-1")
             if 0 <= i < len(targets):
                 t = targets[i]
-                ok = False
-                code = None
+                ok, code = False, None
                 if t["mode"] == "http":
                     ok, code = check_http(t["url"])
                 elif t["mode"] == "tcp":
                     ok = check_tcp(t["host"], t["port"])
                 else:
                     ok, code = check_ping(t["host"])
-                if i < len(states):
-                    states[i]["last_code"] = code
+                if i < len(states): states[i]["last_code"] = code
                 if t["mode"] == "ping":
                     flash = ("UP ✅" if ok else "DOWN ❌") + ("" if code is None else " ({} ms)".format(code))
                 else:
@@ -937,36 +1025,14 @@ def serve_once(targets, states):
             else:
                 flash = "Indice non valido."
             http_response(conn, body=render_page(targets, states, flash))
-
-        elif path == "/set":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            try:
-                ci = int(params.get("ci", "") or CONFIG["CHECK_INTERVAL"])
-                up = int(params.get("up", "") or CONFIG["UP_THRESHOLD"])
-                dn = int(params.get("dn", "") or CONFIG["DOWN_THRESHOLD"])
-            except:
-                ci = CONFIG["CHECK_INTERVAL"]
-                up = CONFIG["UP_THRESHOLD"]
-                dn = CONFIG["DOWN_THRESHOLD"]
-
-            ci = max(5, min(ci, 3600))
-            up = max(1, min(up, 10))
-            dn = max(1, min(dn, 10))
-
-            CONFIG["CHECK_INTERVAL"] = ci
-            CONFIG["UP_THRESHOLD"] = up
-            CONFIG["DOWN_THRESHOLD"] = dn
-            save_runtime_config()
-
-            flash = "Impostazioni salvate: intervallo {}s, UP={}, DOWN={}.".format(ci, up, dn)
-            http_response(conn, body=render_page(targets, states, flash))
+            conn.close(); return targets, states
 
         elif path == "/notify_test":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
             body = render_notify_test_page(targets)
             http_response(conn, body=body)
+            conn.close(); return targets, states
 
         elif path == "/notifymode":
             if not require_auth_or_deny():
@@ -976,13 +1042,14 @@ def serve_once(targets, states):
                 t = targets[i]
                 t["silent"] = not bool(t.get("silent", False))
                 save_targets(targets)
-                flash = "Modalità notifiche aggiornata per '{}' (ora: {}).".format(
-                    t.get("name", "target"),
-                    "silenziose" if t["silent"] else "sonore"
+                flash = "Modalità notifica: {} per '{}'".format(
+                    "silenziosa" if t["silent"] else "sonora",
+                    t.get("name","target")
                 )
             else:
                 flash = "Indice non valido."
             http_response(conn, body=render_page(targets, states, flash))
+            conn.close(); return targets, states
 
         elif path == "/notify":
             if not require_auth_or_deny():
@@ -993,64 +1060,116 @@ def serve_once(targets, states):
                 t = targets[i]
                 silent = (mode == "silent")
                 icon = "🔕" if silent else "🔔"
-                msg = "{} Test notifica — {}".format(icon, t.get("name", "target"))
-                notify(msg, silent=silent)
-                flash = "Notifica {} inviata per '{}'.".format(
-                    "silenziosa" if silent else "sonora",
-                    t.get("name", "target")
-                )
+                notify("{} Test notifica — {}".format(icon, t.get("name","target")), silent=silent)
+                body = render_notify_test_page(targets, "Notifica {} inviata per '{}'.".format(
+                    "silenziosa" if silent else "sonora", t.get("name","target")))
             else:
-                flash = "Indice non valido."
-            body = render_notify_test_page(targets, flash)
+                body = render_notify_test_page(targets, "Indice non valido.")
             http_response(conn, body=body)
+            conn.close(); return targets, states
 
         elif path == "/tg_toggle":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
             CONFIG["TELEGRAM_ENABLED"] = not CONFIG["TELEGRAM_ENABLED"]
             save_telegram_config()
-            state = "abilitate" if CONFIG["TELEGRAM_ENABLED"] else "disabilitate"
-            flash = "Notifiche Telegram {}.".format(state)
+            flash = "Notifiche Telegram {}.".format(
+                "abilitate" if CONFIG["TELEGRAM_ENABLED"] else "disabilitate")
             http_response(conn, body=render_page(targets, states, flash))
+            conn.close(); return targets, states
 
         elif path == "/telegram":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
-            body = render_telegram_page("")
-            http_response(conn, body=body)
+            http_response(conn, body=render_telegram_page(""))
+            conn.close(); return targets, states
 
         elif path == "/telegram_save":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
-            token = params.get("token", "").strip()
-            chat = params.get("chat", "").strip()
-            enabled_flag = params.get("enabled", "")
-
+            token = params.get("token","").strip()
+            chat  = params.get("chat","").strip()
+            enabled_flag = params.get("enabled","")
             if token:
                 CONFIG["TELEGRAM_BOT_TOKEN"] = token
             if chat:
                 CONFIG["TELEGRAM_CHAT_ID"] = chat
             CONFIG["TELEGRAM_ENABLED"] = bool(enabled_flag)
-
             save_telegram_config()
-            body = render_telegram_page("Configurazione Telegram aggiornata.")
-            http_response(conn, body=body)
+            http_response(conn, body=render_telegram_page("Configurazione Telegram aggiornata."))
+            conn.close(); return targets, states
+
+        elif path == "/settings":
+            if not require_auth_or_deny():
+                conn.close(); return targets, states
+            # se GET senza parametri -> mostra form
+            if not params:
+                body = render_settings_page()
+                http_response(conn, body=body)
+                conn.close(); return targets, states
+
+            # altrimenti: salvataggio valori
+            try:
+                ci = int(params.get("ci", CONFIG["CHECK_INTERVAL"]))
+            except:
+                ci = CONFIG["CHECK_INTERVAL"]
+            try:
+                up = int(params.get("up", CONFIG["UP_THRESHOLD"]))
+            except:
+                up = CONFIG["UP_THRESHOLD"]
+            try:
+                dn = int(params.get("dn", CONFIG["DOWN_THRESHOLD"]))
+            except:
+                dn = CONFIG["DOWN_THRESHOLD"]
+
+            # clamp
+            ci = max(5, min(ci, 3600))
+            up = max(1, min(up, 10))
+            dn = max(1, min(dn, 10))
+
+            CONFIG["CHECK_INTERVAL"]  = ci
+            CONFIG["UP_THRESHOLD"]    = up
+            CONFIG["DOWN_THRESHOLD"]  = dn
+            save_runtime_config()
+
+            flash = "Impostazioni salvate: intervallo {}s, UP={}, DOWN={}.".format(ci, up, dn)
+            http_response(conn, body=render_page(targets, states, flash))
+            conn.close(); return targets, states
 
         elif path == "/reboot":
             if not require_auth_or_deny():
                 conn.close(); return targets, states
-            http_response(conn, body="Reboot in corso...")
-            conn.close()
-            notify("♻️ Reboot richiesto dalla web UI.", silent=True)
-            time.sleep(1)
+            http_response(conn, body="Reboot in corso… fra 2 secondi.")
+            try: conn.close()
+            except: pass
+            try: notify("♻️ Reboot richiesto dalla web UI.", silent=True)
+            except: pass
+            try:
+                global SERVER_SOCK
+                if SERVER_SOCK: SERVER_SOCK.close()
+            except: pass
+            SERVER_SOCK = None
+            try:
+                wlan = network.WLAN(network.STA_IF); wlan.active(False)
+            except: pass
+            time.sleep(2)
             machine.reset()
 
-        else:
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            http_response(conn, "404 Not Found", body="Not Found")
-
+        # --- Fallback 404 per QUALSIASI altra rotta ---
+        http_response(conn, "404 Not Found", body="Not Found")
         conn.close()
+        return targets, states
+
+    except Exception as e:
+        print("[HTTP] serve error:", repr(e))
+        try:
+            if SERVER_SOCK:
+                SERVER_SOCK.close()
+        except:
+            pass
+        SERVER_SOCK = None
+        gc.collect()
+        time.sleep(0.1)
         return targets, states
 
     except Exception as e:
@@ -1077,7 +1196,17 @@ def main():
     load_telegram_config()
 
     targets = load_targets()
+    print("[DEBUG] targets dopo load:", targets)  #<- Commenta per debug
+    print("[DEBUG] targets type:", type(targets))  #<- Commenta per debug
+    
+    # AGGIUNGI questo controllo di sicurezza
+    if targets is None or not isinstance(targets, list):
+        print("[CFG] targets is None or invalid, using empty list")
+        targets = []
+    
     states = [{"status": None, "oks": 0, "fails": 0, "last_code": None} for _ in targets]
+    print("[DEBUG] states inizializzati:", len(states))  #<- Commenta per debug
+
 
     last_check_ms = time.ticks_ms()
     wifi_fail_count = 0
@@ -1154,10 +1283,13 @@ def main():
 
 try:
     main()
+except KeyboardInterrupt:
+    # Interruzione manuale da Thonny
+    pass
 except Exception as e:
     try:
-        notify("⚠️ Monitor Pico: eccezione inattesa, riavvio…", silent=True)
+        print("[FATAL] eccezione fuori da main:", repr(e))
     except:
         pass
-    time.sleep(2)
-    machine.reset()
+    time.sleep(2)      #<- Commenta per debug
+    machine.reset()    #<- Commenta per debug
