@@ -33,7 +33,8 @@ CONFIG = {
 
 
     "HTTP_PORT": 8080,
-
+    
+    #default polling conf here
     "CHECK_INTERVAL": 15,   # secondi
     "DOWN_THRESHOLD": 2,    # consecutivi KO per marcare DOWN
     "UP_THRESHOLD": 2,      # consecutivi OK per marcare UP
@@ -51,6 +52,8 @@ CONFIG = {
 #   python - <<'PY'
 #   import hashlib; print(hashlib.sha256(b"tuaPasswordQui").hexdigest())
 #   PY
+
+
 AUTH = {
     "USER": "admin",
     "PASS_SHA256": "placeholder_psw",
@@ -147,13 +150,12 @@ def save_telegram_config():
 # =======================
 def load_targets():
     fname = CONFIG["TARGETS_FILE"]
-    data = []  # <- INIZIALIZZA SEMPRE con lista vuota
+    data = []
     
     try:
         if fname in os.listdir():
             with open(fname, "r") as f:
                 data = json.load(f)
-                # se il file contenesse "null" o roba strana, forziamo lista
                 if not isinstance(data, list):
                     data = []
         else:
@@ -176,7 +178,7 @@ def load_targets():
         elif mode == "ping" and t.get("host"):
             out.append({"name": name, "mode": "ping", "host": t["host"], "silent": silent})
 
-    return out  # SEMPRE restituisce una lista (anche se vuota)
+    return out
 
 def save_targets(targets):
     try:
@@ -1199,7 +1201,6 @@ def main():
     print("[DEBUG] targets dopo load:", targets)  #<- Commenta per debug
     print("[DEBUG] targets type:", type(targets))  #<- Commenta per debug
     
-    # AGGIUNGI questo controllo di sicurezza
     if targets is None or not isinstance(targets, list):
         print("[CFG] targets is None or invalid, using empty list")
         targets = []
