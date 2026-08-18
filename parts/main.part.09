@@ -1,0 +1,251 @@
+            return targets, states
+
+        elif path == "/telegram_test":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            elif not CONFIG.get("TELEGRAM_ENABLED"):
+                flash = "Telegram globale è disabilitato."
+            elif not CONFIG.get("TELEGRAM_BOT_TOKEN"):
+                flash = "Bot token non configurato."
+            else:
+                ok = telegram_send(
+                    CONFIG.get("TELEGRAM_BOT_TOKEN", ""),
+                    chat.get("chat_id", ""),
+                    "🧭 Pico Uptime — test chat '{}'".format(chat.get("name", key)),
+                    silent=False
+                )
+                flash = "Test inviato a '{}'.".format(chat.get("name", key)) if ok else "Invio test fallito."
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        # Compatibilità con il vecchio link/toggle globale.
+        elif path == "/tg_toggle":
+            CONFIG["TELEGRAM_ENABLED"] = not CONFIG.get("TELEGRAM_ENABLED", True)
+            save_telegram_config()
+            http_response(
+                conn,
+                body=render_page(
+                    targets,
+                    states,
+                    "Telegram {}.".format("abilitato" if CONFIG["TELEGRAM_ENABLED"] else "disabilitato")
+                )
+            )
+            conn.close()
+            return targets, states
+
+        elif path == "/settings":
+            # GET senza parametri: mostra la pagina.
+            if not params:
+                http_response(conn, body=render_settings_page(""))
+                conn.close()
+                return targets, states
+
+            try:
+                ci = int(params.get("ci", CONFIG["CHECK_INTERVAL"]))
+            except:
+                ci = CONFIG["CHECK_INTERVAL"]
+            try:
+                up = int(params.get("up", CONFIG["UP_THRESHOLD"]))
+            except:
+                up = CONFIG["UP_THRESHOLD"]
+            try:
+                dn = int(params.get("dn", CONFIG["DOWN_THRESHOLD"]))
+            except:
+                dn = CONFIG["DOWN_THRESHOLD"]
+
+            ci = max(5, min(ci, 3600))
+            up = max(1, min(up, 10))
+            dn = max(1, min(dn, 10))
+
+            CONFIG["CHECK_INTERVAL"] = ci
+            CONFIG["UP_THRESHOLD"] = up
+            CONFIG["DOWN_THRESHOLD"] = dn
+            save_runtime_config()
+
+            flash = "Impostazioni salvate: polling {}s, UP {}, DOWN {}.".format(ci, up, dn)
+            http_response(conn, body=render_settings_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/reboot":
+            http_response(conn, body="Reboot in corso… fra 2 secondi.")
+            try:
+                conn.close()
+            except:
+                pass
+            try:
+                notify("♻️ Reboot richiesto dalla web UI.", silent=True)
+            except:
+                pass
+            try:
+                if SERVER_SOCK:
+                    SERVER_SOCK.close()
+            except:
+                pass
+            SERVER_SOCK = None
+            try:
+                wlan = network.WLAN(network.STA_IF)
+                wlan.active(False)
+            except:
+                pass
+            time.sleep(2)
+            machine.reset()
+
+        http_response(conn, "404 Not Found", body="Not Found")
+        conn.close()
+        return targets, states
+
+    except Exception as e:
+        print("[HTTP] serve error:", repr(e))
+        try:
+            if SERVER_SOCK:
+                SERVER_SOCK.close()
+        except:
+            pass
+        SERVER_SOCK = None
+        gc.collect()
+        time.sleep(0.1)
+        return targets, states
+
+# =======================
+# ===== MAIN LOOP =======
+# =======================
+def main():
+    global LAST_POLL_UPTIME_MS
+    print("[PicoUptime] starting...")
+    while not wifi_connect(CONFIG["WIFI_SSID"], CONFIG["WIFI_PASSWORD"]):
+        time.sleep(3)
+
+    load_runtime_config()
+    load_telegram_config()
+
+    targets = load_targets()
+
+
+    # Fallback di sicurezza se targets.json non è valido.
+    if targets is None or not isinstance(targets, list):
+        print("[CFG] targets is None or invalid, using empty list")
+        targets = []
+
+    states = [{"status": None, "oks": 0, "fails": 0, "last_code": None} for _ in targets]
+
+
+    last_check_ms = time.ticks_ms()
+    wifi_fail_count = 0
+
+    while True:
+        runtime_tick()
+        wlan = network.WLAN(network.STA_IF)
+        if not wlan.isconnected():
+            wifi_fail_count += 1
+            print("[WiFi] lost, retry", wifi_fail_count)
+            wifi_connect(CONFIG["WIFI_SSID"], CONFIG["WIFI_PASSWORD"])
+            if wifi_fail_count > 10:
+                print("[WiFi] too many fails, rebooting...")
+                notify("⚠️ Riavvio automatico: Wi-Fi non disponibile.", silent=True)
+                time.sleep(2)
+                machine.reset()
+        else:
+            wifi_fail_count = 0
+
+        targets, states = serve_once(targets, states)
+
+        now = time.ticks_ms()
+        interval_ms = CONFIG["CHECK_INTERVAL"] * 1000
+        if time.ticks_diff(now, last_check_ms) >= interval_ms:
+            last_check_ms = now
+
+            if len(states) != len(targets):
+                states = [{"status": None, "oks": 0, "fails": 0, "last_code": None} for _ in targets]
+
+            for i, t in enumerate(targets):
+                try:
+                    if t["mode"] == "http":
+                        ok, code = check_http(t["url"])
+                        states[i]["last_code"] = code
+                    elif t["mode"] == "tcp":
+                        ok = check_tcp(t["host"], t["port"])
+                        states[i]["last_code"] = None
+                    else:
+                        ok, rtt = check_ping(t["host"])
+                        states[i]["last_code"] = rtt
+                except:
+                    ok = False
+                    states[i]["last_code"] = None
+
+                prev = states[i]["status"]
+                silent = bool(t.get("silent", False))
+
+                if ok:
+                    states[i]["oks"] += 1
+                    states[i]["fails"] = 0
+
+                    if prev is None:
+                        if states[i]["oks"] >= CONFIG["UP_THRESHOLD"]:
+                            states[i]["status"] = True
+                            keys = target_chat_keys(t)
+                            print("[MON] UNKNOWN -> UP:", t.get("name", "servizio"), "chat:", keys)
+                            notify(
+                                "✅ {} è ONLINE".format(t.get("name", "servizio")),
+                                silent=silent,
+                                chat_keys=keys
+                            )
+
+                        continue
+
+                    if prev is False and states[i]["oks"] >= CONFIG["UP_THRESHOLD"]:
+                        states[i]["status"] = True
+                        keys = target_chat_keys(t)
+                        print("[MON] DOWN -> UP:", t.get("name", "servizio"), "chat:", keys)
+                        notify(
+                            "✅ {} è ONLINE".format(t.get("name", "servizio")),
+                            silent=silent,
+                            chat_keys=keys
+                        )
+
+
+                else:
+                    states[i]["fails"] += 1
+                    states[i]["oks"] = 0
+
+                    if prev is None:
+                        if states[i]["fails"] >= CONFIG["DOWN_THRESHOLD"]:
+                            states[i]["status"] = False
+                            keys = target_chat_keys(t)
+                            print("[MON] UNKNOWN -> DOWN:", t.get("name", "servizio"), "chat:", keys)
+                            notify(
+                                "❌ {} è OFFLINE".format(t.get("name", "servizio")),
+                                silent=silent,
+                                chat_keys=keys
+                            )
+
+                        continue
+
+                    if prev is True and states[i]["fails"] >= CONFIG["DOWN_THRESHOLD"]:
+                        states[i]["status"] = False
+                        keys = target_chat_keys(t)
+                        print("[MON] UP -> DOWN:", t.get("name", "servizio"), "chat:", keys)
+                        notify(
+                            "❌ {} è OFFLINE".format(t.get("name", "servizio")),
+                            silent=silent,
+                            chat_keys=keys
+                        )
+
+
+            LAST_POLL_UPTIME_MS = runtime_tick()
+
+        time.sleep(0.05)
+
+try:
+    main()
+except KeyboardInterrupt:
+    # Interruzione manuale da Thonny
+    pass
+except Exception as e:
+    try:
+        print("[FATAL] eccezione fuori da main:", repr(e))
+    except:
+        pass
