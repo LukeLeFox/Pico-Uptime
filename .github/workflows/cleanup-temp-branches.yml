@@ -1,0 +1,32 @@
+name: Cleanup temporary branches
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: ${{ github.head_ref == 'cleanup-release-v1.1.9-upload' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for branch in release-v1.1.9-upload cleanup-release-v1.1.9-upload; do
+            code=$(curl -sS -o /tmp/resp -w '%{http_code}' \
+              -X DELETE \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/git/refs/heads/${branch}")
+            if [ "$code" != "204" ] && [ "$code" != "404" ]; then
+              cat /tmp/resp
+              exit 1
+            fi
+          done
