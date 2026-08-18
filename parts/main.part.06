@@ -1,0 +1,226 @@
+    <thead><tr><th>Target</th><th>Chat</th><th>Default target</th><th>Test</th></tr></thead>
+    <tbody>__ROWS__</tbody>
+  </table></div>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash)).replace("__ROWS__", "".join(rows))
+    return ui_shell("Test notifiche", body)
+
+
+def render_settings_page(flash=""):
+    body = """
+__FLASH__
+<div class="panel">
+  <div class="section-title"><h2>Polling e soglie</h2><span class="small">Applicate al volo e salvate in config.json</span></div>
+  <form action="/settings" method="get">
+    <div class="grid3">
+      <div><label>Intervallo polling (secondi)</label><input type="number" name="ci" min="5" max="3600" value="__CI__"></div>
+      <div><label>UP threshold</label><input type="number" name="up" min="1" max="10" value="__UP__"></div>
+      <div><label>DOWN threshold</label><input type="number" name="dn" min="1" max="10" value="__DN__"></div>
+    </div>
+    <div class="actions" style="margin-top:14px"><button type="submit">Salva</button><a class="btn" href="/">Annulla</a></div>
+  </form>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__CI__", str(CONFIG["CHECK_INTERVAL"]))
+    body = body.replace("__UP__", str(CONFIG["UP_THRESHOLD"]))
+    body = body.replace("__DN__", str(CONFIG["DOWN_THRESHOLD"]))
+    return ui_shell("Impostazioni", body)
+
+
+def mask_chat_id(chat_id):
+    value = str(chat_id or "")
+    if len(value) <= 6:
+        return value
+    return "{}…{}".format(value[:3], value[-4:])
+
+
+def render_telegram_page(flash=""):
+    chat_rows = []
+    defaults = get_default_chat_keys()
+
+    for chat in CONFIG.get("TELEGRAM_CHATS", []):
+        key = str(chat.get("key", ""))
+        enabled = bool(chat.get("enabled", True))
+        default_badge = "<span class='badge'>★ default</span>" if key in defaults else ""
+        state_badge = "<span class='status up'>ATTIVA</span>" if enabled else "<span class='status unknown'>OFF</span>"
+        chat_rows.append(
+            "<tr><td><b>{}</b><div class='small'>{}</div></td><td><code>{}</code></td><td>{} {}</td>"
+            "<td><div class='actions'>"
+            "<a class='btn' href='/telegram_test?key={}'>Test</a>"
+            "<a class='btn' href='/telegram_rename?key={}'>Rinomina</a>"
+            "<a class='btn' href='/telegram_toggle?key={}'>{}</a>"
+            "<a class='btn' href='/telegram_default?key={}'>{}</a>"
+            "<a class='btn danger' href='/telegram_del?key={}' onclick='return confirm(\"Rimuovere questa chat?\")'>Elimina</a>"
+            "</div></td></tr>".format(
+                html_escape(str(chat.get("name", key))),
+                html_escape(key),
+                html_escape(mask_chat_id(chat.get("chat_id", ""))),
+                state_badge, default_badge,
+                url_encode(key),
+                url_encode(key),
+                url_encode(key), "Disattiva" if enabled else "Attiva",
+                url_encode(key), "Togli default" if key in defaults else "Default",
+                url_encode(key)
+            )
+        )
+
+    if not chat_rows:
+        chat_rows.append("<tr><td colspan='4'><span class='muted'>Nessuna chat configurata.</span></td></tr>")
+
+    current_token = CONFIG.get("TELEGRAM_BOT_TOKEN", "")
+    if telegram_token_looks_valid(current_token):
+        token_state = "Configurato"
+    elif current_token:
+        token_state = "NON VALIDO"
+    else:
+        token_state = "Non configurato"
+    enabled_checked = "checked" if CONFIG.get("TELEGRAM_ENABLED") else ""
+
+    body = """
+__FLASH__
+<div class="stats">
+  <div class="stat"><span class="muted">Telegram globale</span><b>__GLOBAL__</b></div>
+  <div class="stat"><span class="muted">Bot token</span><b>__TOKENSTATE__</b></div>
+  <div class="stat"><span class="muted">Chat configurate</span><b>__CHATCOUNT__</b></div>
+  <div class="stat"><span class="muted">Chat default</span><b>__DEFAULTCOUNT__</b></div>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Bot Telegram</h2><span class="small">Il token non viene mai mostrato nella pagina</span></div>
+  <form action="/telegram_save" method="post">
+    <label>Nuovo bot token</label>
+    <input type="password" name="token" autocomplete="new-password" placeholder="Lascia vuoto per mantenere quello attuale">
+    <label class="check" style="margin-top:10px;width:max-content"><input type="checkbox" name="enabled" value="1" __ENABLEDCHECK__> Notifiche Telegram abilitate</label>
+    <div style="margin-top:12px"><button type="submit">Salva configurazione bot</button></div>
+  </form>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Chat</h2><span class="small">Una o più chat possono essere associate a ogni target</span></div>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Nome</th><th>Chat ID</th><th>Stato</th><th>Azioni</th></tr></thead>
+    <tbody>__CHATROWS__</tbody>
+  </table></div>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Aggiungi chat</h2></div>
+  <form action="/telegram_add" method="post">
+    <div class="grid3">
+      <div><label>Nome</label><input name="name" required placeholder="NOC"></div>
+      <div><label>Chiave</label><input name="key" placeholder="noc"><span class="small">Se vuota viene generata dal nome.</span></div>
+      <div><label>Chat ID</label><input name="chat_id" required placeholder="-1001234567890"></div>
+    </div>
+    <div class="checks" style="margin-top:10px">
+      <label class="check"><input type="checkbox" name="chat_enabled" value="1" checked> Attiva</label>
+      <label class="check"><input type="checkbox" name="make_default" value="1"> Predefinita</label>
+    </div>
+    <div style="margin-top:12px"><button type="submit">＋ Aggiungi chat</button></div>
+  </form>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__GLOBAL__", "ON" if CONFIG.get("TELEGRAM_ENABLED") else "OFF")
+    body = body.replace("__TOKENSTATE__", token_state)
+    body = body.replace("__CHATCOUNT__", str(len(CONFIG.get("TELEGRAM_CHATS", []))))
+    body = body.replace("__DEFAULTCOUNT__", str(len(defaults)))
+    body = body.replace("__ENABLEDCHECK__", enabled_checked)
+    body = body.replace("__CHATROWS__", "".join(chat_rows))
+    return ui_shell("Telegram", body)
+
+
+def render_telegram_rename_page(key, flash=""):
+    chat = get_telegram_chat(key)
+    if chat is None:
+        return render_telegram_page("Chat non trovata.")
+
+    body = """
+__FLASH__
+<div class="panel">
+  <div class="section-title">
+    <h2>Rinomina chat</h2>
+    <span class="small">Cambia solo il nome visualizzato in Pico Uptime</span>
+  </div>
+
+  <div class="stats" style="margin-bottom:16px">
+    <div class="stat"><span class="muted">Chiave interna</span><b>__KEY__</b></div>
+    <div class="stat"><span class="muted">Chat ID</span><b>__CHATID__</b></div>
+  </div>
+
+  <form action="/telegram_rename_save" method="post">
+    <input type="hidden" name="key" value="__KEYVALUE__">
+
+    <label>Nome visualizzato</label>
+    <input name="name" required maxlength="48" value="__NAME__" placeholder="Nome chat">
+
+    <div class="actions" style="margin-top:14px">
+      <button type="submit">Salva nuovo nome</button>
+      <a class="btn" href="/telegram">Annulla</a>
+    </div>
+  </form>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__KEY__", html_escape(str(chat.get("key", key))))
+    body = body.replace("__KEYVALUE__", html_escape(str(chat.get("key", key))))
+    body = body.replace("__CHATID__", html_escape(mask_chat_id(chat.get("chat_id", ""))))
+    body = body.replace("__NAME__", html_escape(str(chat.get("name", key))))
+    return ui_shell("Rinomina chat", body)
+
+
+# =======================
+# == SERVER HTTP LOGICA ==
+# =======================
+SERVER_SOCK = None
+
+def ensure_server_socket():
+    global SERVER_SOCK
+    if SERVER_SOCK is not None:
+        return True
+    try:
+        port = CONFIG.get("HTTP_PORT", 80)
+        s = socket.socket()
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except:
+            pass
+        s.bind(("0.0.0.0", port))
+        s.listen(2)
+        s.settimeout(0.2)
+        SERVER_SOCK = s
+        print("[HTTP] listening on port", port)
+        return True
+    except Exception as e:
+        print("[HTTP] create socket error:", repr(e))
+        try:
+            if s:
+                s.close()
+        except:
+            pass
+        SERVER_SOCK = None
+        gc.collect()
+        time.sleep(0.3)
+        return False
+
+def serve_once(targets, states):
+    global SERVER_SOCK
+
+    if not ensure_server_socket():
+        return targets, states
+
+    try:
+        try:
+            conn, addr = SERVER_SOCK.accept()
+        except OSError:
+            return targets, states
+
+        conn.settimeout(1.0)
+
+        # Legge almeno tutti gli header HTTP.
+        data = b""
+        try:
+            while b"\r\n\r\n" not in data and len(data) < 4096:
+                chunk = conn.recv(1024)
+                if not chunk:
