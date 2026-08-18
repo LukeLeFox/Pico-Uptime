@@ -1,0 +1,12 @@
+# Pico Uptime runtime configuration / secrets
+config.json
+targets.json
+telegram.json
+
+# Python / editors
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
