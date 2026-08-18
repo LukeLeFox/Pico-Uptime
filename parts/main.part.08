@@ -1,0 +1,219 @@
+                if i < len(states):
+                    states[i]["last_code"] = code
+
+                detail = ""
+                if target.get("mode") == "ping" and code is not None:
+                    detail = " ({} ms)".format(code)
+                elif target.get("mode") == "http" and code is not None:
+                    detail = " (HTTP {})".format(code)
+
+                flash = "Verifica manuale: {} {}{} — non modifica stato/soglie e non invia alert.".format(
+                    target.get("name", "target"),
+                    "UP ✅" if ok else "DOWN ❌",
+                    detail
+                )
+            else:
+                flash = "Indice target non valido."
+
+            http_response(conn, body=render_page(targets, states, flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/notify_test":
+            http_response(conn, body=render_notify_test_page(targets))
+            conn.close()
+            return targets, states
+
+        elif path == "/notifymode":
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
+            if 0 <= i < len(targets):
+                target = targets[i]
+                target["silent"] = not bool(target.get("silent", False))
+                save_targets(targets)
+                flash = "Notifica {} per '{}'.".format(
+                    "silenziosa" if target["silent"] else "sonora",
+                    target.get("name", "target")
+                )
+            else:
+                flash = "Indice target non valido."
+            http_response(conn, body=render_page(targets, states, flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/notify":
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
+            mode = params.get("mode", "normal")
+            if 0 <= i < len(targets):
+                target = targets[i]
+                silent = mode == "silent"
+                keys = target_chat_keys(target)
+                sent = notify(
+                    "{} Test notifica — {}".format("🔕" if silent else "🔔", target.get("name", "target")),
+                    silent=silent,
+                    chat_keys=keys
+                )
+                flash = "Test inviato a {} chat per '{}'.".format(sent, target.get("name", "target"))
+            else:
+                flash = "Indice target non valido."
+            http_response(conn, body=render_notify_test_page(targets, flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram":
+            http_response(conn, body=render_telegram_page(""))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_save":
+            token = params.get("token", "").strip()
+            if token:
+                CONFIG["TELEGRAM_BOT_TOKEN"] = token
+            CONFIG["TELEGRAM_ENABLED"] = params.get("enabled", "") == "1"
+            save_telegram_config()
+            http_response(conn, body=render_telegram_page("Configurazione bot aggiornata."))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_add":
+            name = params.get("name", "").strip()
+            chat_id = params.get("chat_id", "").strip()
+            requested_key = params.get("key", "").strip()
+            key = normalize_chat_key(requested_key or name, "chat")
+
+            if not name or not chat_id:
+                flash = "Nome e Chat ID sono obbligatori."
+            elif get_telegram_chat(key) is not None:
+                flash = "La chiave '{}' esiste già.".format(key)
+            else:
+                chat = {
+                    "key": key,
+                    "name": name,
+                    "chat_id": chat_id,
+                    "enabled": params.get("chat_enabled", "") == "1",
+                }
+                CONFIG["TELEGRAM_CHATS"].append(chat)
+
+                defaults = get_default_chat_keys()
+                if params.get("make_default", "") == "1" or not defaults:
+                    if key not in defaults:
+                        defaults.append(key)
+                    CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+
+                save_telegram_config()
+                flash = "Chat '{}' aggiunta.".format(name)
+
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_rename":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                http_response(conn, body=render_telegram_page("Chat non trovata."))
+            else:
+                http_response(conn, body=render_telegram_rename_page(key, ""))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_rename_save":
+            key = params.get("key", "")
+            new_name = params.get("name", "").strip()
+            chat = get_telegram_chat(key)
+
+            if chat is None:
+                flash = "Chat non trovata."
+            elif not new_name:
+                http_response(conn, body=render_telegram_rename_page(key, "Il nome non può essere vuoto."))
+                conn.close()
+                return targets, states
+            else:
+                old_name = str(chat.get("name", key))
+                chat["name"] = new_name[:48]
+                save_telegram_config()
+                flash = "Chat '{}' rinominata in '{}'.".format(old_name, chat["name"])
+
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_toggle":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            else:
+                chat["enabled"] = not bool(chat.get("enabled", True))
+                save_telegram_config()
+                flash = "Chat '{}' {}.".format(
+                    chat.get("name", key),
+                    "attivata" if chat["enabled"] else "disattivata"
+                )
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_default":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            else:
+                defaults = list(CONFIG.get("TELEGRAM_DEFAULT_CHAT_KEYS", []))
+                if key in defaults:
+                    if len(defaults) <= 1:
+                        flash = "Deve rimanere almeno una chat predefinita."
+                    else:
+                        defaults.remove(key)
+                        CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+                        save_telegram_config()
+                        flash = "'{}' rimossa dalle chat predefinite.".format(chat.get("name", key))
+                else:
+                    defaults.append(key)
+                    CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+                    save_telegram_config()
+                    flash = "'{}' aggiunta alle chat predefinite.".format(chat.get("name", key))
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_del":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            else:
+                name = chat.get("name", key)
+                new_chats = []
+                for current in CONFIG.get("TELEGRAM_CHATS", []):
+                    if current.get("key") != key:
+                        new_chats.append(current)
+                CONFIG["TELEGRAM_CHATS"] = new_chats
+
+                defaults = []
+                for current_key in CONFIG.get("TELEGRAM_DEFAULT_CHAT_KEYS", []):
+                    if current_key != key:
+                        defaults.append(current_key)
+                CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+
+                # Rimuove la chat anche dalle assegnazioni esplicite dei target.
+                targets_changed = False
+                for target in targets:
+                    if "notify_chat_keys" in target and isinstance(target.get("notify_chat_keys"), list):
+                        if key in target["notify_chat_keys"]:
+                            target["notify_chat_keys"].remove(key)
+                            targets_changed = True
+                if targets_changed:
+                    save_targets(targets)
+
+                save_telegram_config()
+                flash = "Chat '{}' eliminata.".format(name)
+
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
