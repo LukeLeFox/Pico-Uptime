@@ -2,152 +2,152 @@
 
 [![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi%20Pico%20W-orange.svg)]()
 [![Language](https://img.shields.io/badge/language-MicroPython-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.9-blue.svg)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)]()
-[![Status](https://img.shields.io/badge/status-beta-lightgrey.svg)]()
+[![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 
-Pico Uptime è un mini sistema di monitoraggio scritto in MicroPython che trasforma un Raspberry Pi Pico W in un uptime monitor web-based. Leggero, autonomo e configurabile direttamente da browser — senza ricompilare il codice.
+**Pico Uptime** trasforma un Raspberry Pi Pico W in un piccolo uptime monitor autonomo, con dashboard web, controlli HTTP/TCP/ICMP e notifiche Telegram.
 
----
+Il progetto è volutamente leggero: nessun framework web, nessun database e nessun servizio cloud obbligatorio oltre a Telegram, se abilitato.
 
-## Funzionalità principali
+## Funzionalità
 
-- ✅ **Monitoraggio multiprotocollo**
-  - HTTP / HTTPS (codici di stato)
-  - TCP (connessione socket)
-  - Ping ICMP
-- 🖥️ **Interfaccia Web integrata**
-  - Dashboard con stato in tempo reale
-  - Aggiunta / rimozione target via browser
-  - Gestione modalità silenziosa per singolo target
-- 📲 **Notifiche Telegram**
-  - Messaggi per transizioni UP/DOWN
-  - Modalità silenziosa
-  - Configurazione da pagina `/telegram`
-- 🛠️ **Configurazione persistente**
-  - File JSON:
-    - `targets.json`
-    - `config.json`
-    - `telegram.json`
-- ♻️ **Auto-protezione**
-  - Riavvio automatico se il Wi-Fi resta down per troppo tempo
-  - Pulsante reboot da UI
-- 🔐 **Sicurezza**
-  - Accesso con Basic Auth
-  - Protezione tentativi multipli errati
+- **Monitoraggio multiprotocollo**: HTTP/HTTPS, TCP e Ping ICMP con RTT.
+- **Dashboard web responsive** con stato UP/DOWN/UNKNOWN, aggiunta/modifica/eliminazione target e test manuale.
+- **Diagnostica compatta**: uptime, RSSI Wi-Fi, IP, RAM libera, numero target e ultimo polling.
+- **Telegram multi-chat**: più chat con un singolo bot, una o più chat per target, chat predefinite, test e rinomina.
+- **Notifiche sonore/silenziose per target**.
+- **Polling persistente** con intervallo e soglie UP/DOWN configurabili da browser.
+- **Persistenza JSON** tramite `config.json`, `targets.json` e `telegram.json`.
+- **Basic Auth** su tutta l'interfaccia con blocco temporaneo dopo login falliti.
+- **Recovery Wi-Fi** e reboot manuale dalla UI.
+- Compatibilità con il vecchio formato Telegram single-chat (`TELEGRAM_CHAT_ID`).
 
----
+## Requisiti
 
-## Struttura dei file
+- Raspberry Pi Pico W
+- MicroPython recente per Pico W
+- rete Wi-Fi 2.4 GHz
+- facoltativo: bot Telegram
 
-| File            | Descrizione                               |
-|----------------|-------------------------------------------|
-| `main.py`      | Codice principale (server web + monitor)  |
-| `targets.json` | Lista target monitorati                   |
-| `config.json`  | Intervallo/soglie di polling              |
-| `telegram.json`| Config Telegram (token, chat_id, enable)  |
+## Installazione
 
-I file JSON possono essere preparati a mano oppure generati / aggiornati dall'interfaccia web.
+1. Installa MicroPython sul Pico W.
+2. Copia `main.py` nella root del filesystem.
+3. Configura SSID e password nella sezione `CONFIG`:
 
----
+```python
+CONFIG = {
+    "WIFI_SSID": "your_wifi_ssid",
+    "WIFI_PASSWORD": "your_wifi_password",
+    "HTTP_PORT": 8080,
+}
+```
 
-## Esempi di configurazione
+4. Genera l'hash SHA-256 della password web:
 
-### `telegram.json`
+```bash
+python -c "import hashlib; print(hashlib.sha256(b'your_password').hexdigest())"
+```
+
+5. Inseriscilo in `AUTH["PASS_SHA256"]`.
+6. Riavvia il Pico e apri `http://IP_DEL_PICO:8080`.
+
+I file JSON vengono creati o aggiornati dall'interfaccia quando necessario.
+
+## Telegram multi-chat
+
+Esempio `telegram.json`:
 
 ```json
 {
   "TELEGRAM_ENABLED": true,
-  "TELEGRAM_BOT_TOKEN": "123456789:ABCDEF_TUO_TOKEN",
+  "TELEGRAM_BOT_TOKEN": "123456789:YOUR_BOT_TOKEN",
+  "TELEGRAM_CHATS": [
+    {"key": "home", "name": "Home", "chat_id": "123456789", "enabled": true},
+    {"key": "noc", "name": "NOC", "chat_id": "-1001234567890", "enabled": true}
+  ],
+  "DEFAULT_CHAT_KEYS": ["home"]
+}
+```
+
+La `key` è l'identificatore interno. Il nome visualizzato può essere rinominato dalla UI senza rompere le associazioni dei target.
+
+Il vecchio formato resta supportato:
+
+```json
+{
+  "TELEGRAM_ENABLED": true,
+  "TELEGRAM_BOT_TOKEN": "123456789:YOUR_BOT_TOKEN",
   "TELEGRAM_CHAT_ID": "123456789"
 }
 ```
 
-### `targets.json`
+## Target
+
+Esempio `targets.json`:
 
 ```json
 [
   {
-    "name": "cloudflare",
+    "name": "Gateway",
     "mode": "ping",
-    "host": "1.1.1.1",
-    "silent": false
+    "host": "192.168.1.1",
+    "silent": false,
+    "notify_chat_keys": ["home", "noc"]
   },
   {
-    "name": "google dns",
-    "mode": "tcp",
-    "host": "8.8.8.8",
-    "port": 53,
-    "silent": false
+    "name": "Web service",
+    "mode": "http",
+    "url": "https://example.org/",
+    "silent": true,
+    "notify_chat_keys": ["noc"]
   }
 ]
 ```
 
----
+`notify_chat_keys: []` disabilita intenzionalmente gli alert per quel target. Se la chiave manca, vengono usate le chat predefinite.
 
-## Installazione
+## Polling
 
-1. Flash MicroPython (>= 1.22) sul Raspberry Pi Pico W.
-2. Copia `main.py` sul Pico W (via Thonny, mpremote, ecc.).
-3. (Opzionale) Crea `targets.json`, `config.json` e `telegram.json` seguendo gli esempi sopra.
-4. Modifica in `main.py` la sezione `CONFIG` con SSID e password Wi-Fi.
-5. Genera l'hash della password per la Basic Auth:
+Esempio `config.json`:
 
-```bash
-python - << 'PY'
-import hashlib
-print(hashlib.sha256(b"tuaPasswordQui").hexdigest())
-PY
+```json
+{
+  "CHECK_INTERVAL": 30,
+  "UP_THRESHOLD": 4,
+  "DOWN_THRESHOLD": 6
+}
 ```
-
-6. Inserisci l'hash in `AUTH["PASS_SHA256"]` dentro `main.py`.
-7. Riavvia il Pico W e controlla la seriale/log:
-
-```text
-[WiFi] connected, IP: 192.168.x.x
-[HTTP] listening on port 8080
-```
-
-8. Apri il browser su `http://192.168.x.x:8080` e usa la dashboard.
-
----
 
 ## Endpoint principali
 
-| Endpoint          | Funzione                         |
-|------------------|----------------------------------|
-| `/`              | Dashboard principale             |
-| `/add`           | Aggiungi target                  |
-| `/del?i=X`       | Rimuovi target X                 |
-| `/test?i=X`      | Test target X                    |
-| `/notifymode?i=X`| Cambia modalità notifica target  |
-| `/telegram`      | Configurazione Telegram          |
-| `/telegram_save` | Salvataggio config Telegram      |
-| `/notify_test`   | Test invio notifica Telegram     |
-| `/set`           | Aggiorna intervalli/soglie       |
-| `/reboot`        | Reboot sicuro del dispositivo    |
+| Endpoint | Funzione |
+|---|---|
+| `/` | Dashboard |
+| `/add` | Aggiunge un target |
+| `/edit?i=X` | Modifica un target |
+| `/del?i=X` | Elimina un target |
+| `/test?i=X` | Verifica manualmente un target |
+| `/notify?i=X` | Test Telegram per il target |
+| `/notifymode?i=X` | Alterna sonora/silenziosa |
+| `/telegram` | Gestione Telegram/chat |
+| `/telegram_test?key=X` | Test singola chat |
+| `/telegram_rename?key=X` | Rinomina chat |
+| `/settings` | Polling e soglie |
+| `/reboot` | Riavvia il Pico W |
 
----
+Tutti gli endpoint applicativi richiedono autenticazione.
 
-## .gitignore consigliato
+## Segreti e file locali
 
-```
-targets.json
-config.json
-telegram.json
-*.pyc
-.vscode/
-.idea/
-__pycache__/
-```
+Non committare configurazioni reali o credenziali. `config.json`, `targets.json` e `telegram.json` sono esclusi da Git tramite `.gitignore`.
 
----
+SSID, password Wi-Fi e hash della password web vanno configurati localmente prima del deploy.
 
-## Note di sicurezza e privacy
+## Note sulle risorse
 
-- Evita di committare file contenenti token o chat-id veri.
-- Se hai bisogno di rimuovere accidentalmente un secret dal repo, usa `git filter-repo` o la procedura ufficiale GitHub per rimuovere dati sensibili.
-
----
+Pico Uptime gira su un microcontrollore con RAM limitata. La diagnostica è volutamente una singola barra compatta per evitare grosse allocazioni HTML durante il rendering.
 
 ## License
 

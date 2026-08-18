@@ -1,10 +1,10 @@
-# main.py — Pico Uptime (Raspberry Pi Pico W, MicroPython)
+# main.py — Pico Uptime v1.1.9 (Raspberry Pi Pico W, MicroPython)
 # - Web UI con Basic Auth
 # - Monitor HTTP / TCP / PING (ICMP)
-# - Notifiche Telegram su variazioni UP/DOWN
+# - Notifiche Telegram multi-chat su variazioni UP/DOWN
 # - Soglie e intervallo configurabili da UI (persistenti)
 # - Notifiche silenziose/sonore per-target + pagina test notifiche
-# - Config Telegram da UI (telegram.json) + toggle ON/OFF
+# - Chat Telegram selezionabili per-target + configurazione da UI
 # - Reboot da UI
 # - Auto-reboot se Wi-Fi non torna dopo N tentativi
 
@@ -24,26 +24,89 @@ except:
 
 LED = machine.Pin("LED", machine.Pin.OUT)
 
+# Diagnostica leggera
+APP_UPTIME_MS = 0
+APP_LAST_TICK_MS = time.ticks_ms()
+LAST_POLL_UPTIME_MS = None
+
+
+def runtime_tick():
+    global APP_UPTIME_MS, APP_LAST_TICK_MS
+    now = time.ticks_ms()
+    delta = time.ticks_diff(now, APP_LAST_TICK_MS)
+    if delta > 0:
+        APP_UPTIME_MS += delta
+    APP_LAST_TICK_MS = now
+    return APP_UPTIME_MS
+
+
+def fmt_age(ms):
+    if ms is None:
+        return "in attesa"
+    sec = max(0, int(ms // 1000))
+    if sec < 60:
+        return "{}s".format(sec)
+    minutes = sec // 60
+    if minutes < 60:
+        return "{}m".format(minutes)
+    hours = minutes // 60
+    if hours < 48:
+        return "{}h {}m".format(hours, minutes % 60)
+    return "{}g {}h".format(hours // 24, hours % 24)
+
+
+def compact_diag(target_count):
+    now_ms = runtime_tick()
+
+    try:
+        wlan = network.WLAN(network.STA_IF)
+        ip = wlan.ifconfig()[0] if wlan.isconnected() else "offline"
+        try:
+            rssi = "{} dBm".format(int(wlan.status("rssi")))
+        except:
+            rssi = "n/d"
+    except:
+        ip = "n/d"
+        rssi = "n/d"
+
+    try:
+        ram = "{} KB".format(int(gc.mem_free() // 1024))
+    except:
+        ram = "n/d"
+
+    if LAST_POLL_UPTIME_MS is None:
+        poll = "in attesa"
+    else:
+        poll = "{} fa".format(fmt_age(max(0, now_ms - LAST_POLL_UPTIME_MS)))
+
+    return (
+        "<b>Sistema</b> · uptime {} · Wi-Fi {} · IP {} · RAM {} · "
+        "{} target · ultimo polling {}"
+    ).format(
+        fmt_age(now_ms), html_escape(rssi), html_escape(str(ip)),
+        html_escape(ram), target_count, html_escape(poll)
+    )
+
 # =======================
 # ======= CONFIG ========
 # =======================
 CONFIG = {
-    "WIFI_SSID": "placeholder_ssid",
-    "WIFI_PASSWORD": "placeholder_netpsw",
-
+    "WIFI_SSID": "your_wifi_ssid",
+    "WIFI_PASSWORD": "your_wifi_password",
 
     "HTTP_PORT": 8080,
-    
-    #default polling conf here
-    "CHECK_INTERVAL": 15,   # secondi
-    "DOWN_THRESHOLD": 2,    # consecutivi KO per marcare DOWN
-    "UP_THRESHOLD": 2,      # consecutivi OK per marcare UP
-    
-    #default conf telegram here
+
+    "CHECK_INTERVAL": 15,    # secondi
+    "DOWN_THRESHOLD": 2,     # consecutivi KO per marcare DOWN
+    "UP_THRESHOLD": 2,       # consecutivi OK per marcare UP
+
+    # Telegram viene caricato da telegram.json.
+    # I valori qui sotto sono solo fallback sicuri.
     "TELEGRAM_ENABLED": True,
-    "TELEGRAM_BOT_TOKEN": "placeholder_token",
-    "TELEGRAM_CHAT_ID": "placeholder_id",
-    
+    "TELEGRAM_BOT_TOKEN": "",
+    "TELEGRAM_CHATS": [],
+    "TELEGRAM_DEFAULT_CHAT_KEYS": [],
+
     "TARGETS_FILE": "targets.json",
 }
 
@@ -52,14 +115,11 @@ CONFIG = {
 #   python - <<'PY'
 #   import hashlib; print(hashlib.sha256(b"tuaPasswordQui").hexdigest())
 #   PY
-
-
 AUTH = {
     "USER": "admin",
-    "PASS_SHA256": "placeholder_psw",
+    "PASS_SHA256": "your_sha256_password_hash",
     "MAX_FAILS": 5,
     "BLOCK_SECONDS": 30,
-    "HEALTH_PUBLIC_TOKEN": "",  # opzionale per /health senza auth
 }
 
 # === FILE DI CONFIG ===
@@ -88,7 +148,7 @@ def load_runtime_config():
             CONFIG["CHECK_INTERVAL"] = ci
             CONFIG["UP_THRESHOLD"] = up
             CONFIG["DOWN_THRESHOLD"] = dn
-            print("[CFG] runtime loaded:", ci, up, dn) #<- Commenta per debug
+            print("[CFG] runtime loaded:", ci, up, dn)
         else:
             print("[CFG] no config file found, using defaults")
     except Exception as e:
@@ -105,7 +165,7 @@ def save_runtime_config():
         }
         with open(CONFIG_FILE, "w") as f:
             json.dump(data, f)
-        print("[CFG] saved to file") #<- Commenta per debug
+        print("[CFG] saved to file")
         return True
     except Exception as e:
         print("[CFG] save error:", repr(e))
@@ -114,32 +174,138 @@ def save_runtime_config():
 # =======================
 # == TELEGRAM CONFIG IO ==
 # =======================
+def normalize_chat_key(value, fallback="chat"):
+    """Crea una chiave breve/stabile utilizzabile anche nei nomi dei campi HTML."""
+    raw = str(value or "").strip().lower()
+    out = []
+    for ch in raw:
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9") or ch in ("_", "-"):
+            out.append(ch)
+        elif ch in (" ", ".", "/", "\\"):
+            out.append("_")
+    key = "".join(out).strip("_-")
+    return key or fallback
+
+
+def get_telegram_chat(key):
+    key = str(key or "")
+    for chat in CONFIG.get("TELEGRAM_CHATS", []):
+        if str(chat.get("key", "")) == key:
+            return chat
+    return None
+
+
+def get_default_chat_keys():
+    valid = []
+    for key in CONFIG.get("TELEGRAM_DEFAULT_CHAT_KEYS", []):
+        chat = get_telegram_chat(key)
+        if chat is not None and key not in valid:
+            valid.append(key)
+
+    if valid:
+        return valid
+
+    # Se non è ancora stata scelta una chat predefinita, usa la prima attiva.
+    for chat in CONFIG.get("TELEGRAM_CHATS", []):
+        if chat.get("enabled", True):
+            return [str(chat.get("key", ""))]
+    return []
+
+
 def load_telegram_config():
     try:
-        if TELEGRAM_CONFIG_FILE in os.listdir():
-            with open(TELEGRAM_CONFIG_FILE, "r") as f:
-                data = json.load(f)
-            if "TELEGRAM_ENABLED" in data:
-                CONFIG["TELEGRAM_ENABLED"] = bool(data["TELEGRAM_ENABLED"])
-            if "TELEGRAM_BOT_TOKEN" in data and data["TELEGRAM_BOT_TOKEN"]:
-                CONFIG["TELEGRAM_BOT_TOKEN"] = data["TELEGRAM_BOT_TOKEN"]
-            if "TELEGRAM_CHAT_ID" in data and data["TELEGRAM_CHAT_ID"]:
-                CONFIG["TELEGRAM_CHAT_ID"] = str(data["TELEGRAM_CHAT_ID"])
-            print("[TGCFG] loaded from file") #<- Commenta per debug
-        else:
-            save_telegram_config()
+        if TELEGRAM_CONFIG_FILE not in os.listdir():
+            print("[TGCFG] no telegram config file found")
+            return
+
+        with open(TELEGRAM_CONFIG_FILE, "r") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            print("[TGCFG] invalid config, using defaults")
+            return
+
+        if "TELEGRAM_ENABLED" in data:
+            CONFIG["TELEGRAM_ENABLED"] = bool(data["TELEGRAM_ENABLED"])
+
+        if data.get("TELEGRAM_BOT_TOKEN"):
+            candidate_token = str(data["TELEGRAM_BOT_TOKEN"]).strip()
+            if telegram_token_looks_valid(candidate_token):
+                CONFIG["TELEGRAM_BOT_TOKEN"] = candidate_token
+            else:
+                print("[TGCFG] bot token present but invalid; re-enter it from the Telegram page")
+
+        chats = []
+        raw_chats = data.get("TELEGRAM_CHATS")
+
+        # Nuovo formato multi-chat.
+        if isinstance(raw_chats, list):
+            used = []
+            for idx, item in enumerate(raw_chats):
+                if not isinstance(item, dict):
+                    continue
+                chat_id = str(item.get("chat_id", "")).strip()
+                if not chat_id:
+                    continue
+
+                key = normalize_chat_key(item.get("key", ""), "chat{}".format(idx + 1))
+                base_key = key
+                n = 2
+                while key in used:
+                    key = "{}{}".format(base_key, n)
+                    n += 1
+                used.append(key)
+
+                chats.append({
+                    "key": key,
+                    "name": str(item.get("name", key)).strip() or key,
+                    "chat_id": chat_id,
+                    "enabled": bool(item.get("enabled", True)),
+                })
+
+        # Migrazione trasparente dal vecchio telegram.json con TELEGRAM_CHAT_ID.
+        elif data.get("TELEGRAM_CHAT_ID"):
+            chats = [{
+                "key": "default",
+                "name": "Default",
+                "chat_id": str(data.get("TELEGRAM_CHAT_ID")),
+                "enabled": True,
+            }]
+            print("[TGCFG] legacy single-chat config loaded")
+
+        CONFIG["TELEGRAM_CHATS"] = chats
+
+        defaults = data.get("DEFAULT_CHAT_KEYS", data.get("TELEGRAM_DEFAULT_CHAT_KEYS", []))
+        if not isinstance(defaults, list):
+            defaults = []
+
+        clean_defaults = []
+        for key in defaults:
+            key = str(key)
+            if get_telegram_chat(key) is not None and key not in clean_defaults:
+                clean_defaults.append(key)
+
+        if not clean_defaults and chats:
+            clean_defaults = [chats[0]["key"]]
+
+        CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = clean_defaults
+        print("[TGCFG] loaded:", len(chats), "chat(s)")
+
     except Exception as e:
         print("[TGCFG] load error:", repr(e))
+
 
 def save_telegram_config():
     try:
         data = {
-            "TELEGRAM_ENABLED": CONFIG["TELEGRAM_ENABLED"],
-            "TELEGRAM_BOT_TOKEN": CONFIG["TELEGRAM_BOT_TOKEN"],
-            "TELEGRAM_CHAT_ID": CONFIG["TELEGRAM_CHAT_ID"],
+            "TELEGRAM_ENABLED": bool(CONFIG.get("TELEGRAM_ENABLED")),
+            "TELEGRAM_BOT_TOKEN": CONFIG.get("TELEGRAM_BOT_TOKEN", ""),
+            "TELEGRAM_CHATS": CONFIG.get("TELEGRAM_CHATS", []),
+            "DEFAULT_CHAT_KEYS": get_default_chat_keys(),
         }
         with open(TELEGRAM_CONFIG_FILE, "w") as f:
             json.dump(data, f)
+        CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = data["DEFAULT_CHAT_KEYS"]
         return True
     except Exception as e:
         print("[TGCFG] save error:", repr(e))
@@ -151,15 +317,13 @@ def save_telegram_config():
 def load_targets():
     fname = CONFIG["TARGETS_FILE"]
     data = []
-    
+
     try:
         if fname in os.listdir():
             with open(fname, "r") as f:
                 data = json.load(f)
-                if not isinstance(data, list):
-                    data = []
-        else:
-            data = []
+            if not isinstance(data, list):
+                data = []
     except Exception as e:
         print("[CFG] load_targets error:", repr(e))
         data = []
@@ -168,17 +332,49 @@ def load_targets():
     for t in data:
         if not isinstance(t, dict):
             continue
-        mode  = t.get("mode")
-        name  = t.get("name", "target")
-        silent = bool(t.get("silent", False))
+
+        mode = t.get("mode")
+        name = t.get("name", "target")
+        silent = bool(t.get("silent", t.get("mute", False)))
+
+        item = {
+            "name": name,
+            "mode": mode,
+            "silent": silent,
+        }
+
+        # Se la chiave è assente il target è "legacy" e usa le chat predefinite.
+        # Se è presente ed è [], le notifiche sono volutamente disabilitate per quel target.
+        if "notify_chat_keys" in t:
+            keys = t.get("notify_chat_keys")
+            if isinstance(keys, list):
+                clean = []
+                for key in keys:
+                    key = str(key)
+                    if key not in clean:
+                        clean.append(key)
+                item["notify_chat_keys"] = clean
+            else:
+                item["notify_chat_keys"] = []
+
         if mode == "http" and t.get("url"):
-            out.append({"name": name, "mode": "http", "url": t["url"], "silent": silent})
-        elif mode == "tcp" and t.get("host") and int(t.get("port", 0)) > 0:
-            out.append({"name": name, "mode": "tcp", "host": t["host"], "port": int(t["port"]), "silent": silent})
+            item["url"] = t["url"]
+            out.append(item)
+        elif mode == "tcp" and t.get("host"):
+            try:
+                port = int(t.get("port", 0))
+            except:
+                port = 0
+            if port > 0:
+                item["host"] = t["host"]
+                item["port"] = port
+                out.append(item)
         elif mode == "ping" and t.get("host"):
-            out.append({"name": name, "mode": "ping", "host": t["host"], "silent": silent})
+            item["host"] = t["host"]
+            out.append(item)
 
     return out
+
 
 def save_targets(targets):
     try:
@@ -380,41 +576,107 @@ def check_ping(host, timeout_ms=1000, seq=1, payload_size=8):
 # =======================
 # ===== NOTIFICHE =======
 # =======================
+def _socket_write_all(sock, data):
+    """Scrive l'intera richiesta anche se lo stream SSL effettua write parziali."""
+    offset = 0
+    total = len(data)
+    while offset < total:
+        try:
+            written = sock.write(data[offset:])
+        except AttributeError:
+            written = sock.send(data[offset:])
+        if written is None:
+            # Alcune implementazioni stream restituiscono None dopo aver accettato i dati.
+            return True
+        if written <= 0:
+            return False
+        offset += written
+    return True
+
+
+def telegram_token_looks_valid(token):
+    token = str(token or "").strip()
+    if not token or ":" not in token:
+        return False
+    left, right = token.split(":", 1)
+    return bool(left and right and left.isdigit())
+
+
 def telegram_send(bot_token, chat_id, text, silent=False):
     host = "api.telegram.org"
     port = 443
-    path = "/bot{}/sendMessage".format(bot_token)
+    bot_token = str(bot_token or "").strip()
+    chat_id = str(chat_id or "").strip()
 
+    if not telegram_token_looks_valid(bot_token):
+        print("[TG] invalid bot token: configure it from the Telegram page")
+        return False
+    if not chat_id:
+        print("[TG] invalid/empty chat id")
+        return False
+
+    path = "/bot{}/sendMessage".format(bot_token)
     payload = "chat_id={}&text={}&disable_web_page_preview=1".format(
-        url_encode(str(chat_id)),
+        url_encode(chat_id),
         url_encode(text)
     )
     if silent:
         payload += "&disable_notification=true"
 
+    # payload e request sono ASCII perché text/chat_id vengono percent-encoded.
+    payload_bytes = payload.encode()
     req = (
         "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n"
         "Content-Type: application/x-www-form-urlencoded\r\n"
-        "Content-Length: {}\r\n\r\n{}"
-    ).format(path, host, len(payload), payload)
+        "Content-Length: {}\r\n\r\n"
+    ).format(path, host, len(payload_bytes)).encode() + payload_bytes
 
     s = None
     try:
         addr = socket.getaddrinfo(host, port)[0][-1]
         s = socket.socket()
-        s.settimeout(6)
+        s.settimeout(8)
         s.connect(addr)
         s = ssl.wrap_socket(s, server_hostname=host)
-        s.write(req.encode())
-        resp = s.read() or b""
-        if b'"ok":true' not in resp:
+
+        if not _socket_write_all(s, req):
+            print("[TG] socket write failed")
+            return False
+
+        chunks = []
+        while True:
             try:
-                print("[TG] fail:", resp.split(b"\r\n\r\n", 1)[-1].decode())
-            except:
-                print("[TG] fail (raw)")
-        return True
+                chunk = s.read(512)
+            except Exception:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if sum(len(x) for x in chunks) > 4096:
+                break
+        resp = b"".join(chunks)
+
+        head = b""
+        body = resp
+        if b"\r\n\r\n" in resp:
+            head, body = resp.split(b"\r\n\r\n", 1)
+
+        status_line = b""
+        if head:
+            status_line = head.split(b"\r\n", 1)[0]
+
+        ok = b'"ok":true' in body
+        if ok:
+            return True
+
+        try:
+            print("[TG] API FAIL", status_line.decode(), body[:500].decode())
+        except:
+            print("[TG] API FAIL (raw)")
+        return False
+
     except Exception as e:
-        print("[TG] error:", repr(e))
+        print("[TG] transport error:", repr(e))
         return False
     finally:
         try:
@@ -423,13 +685,65 @@ def telegram_send(bot_token, chat_id, text, silent=False):
         except:
             pass
 
-def notify(text, silent=False):
+
+def target_chat_keys(target):
+    if isinstance(target, dict) and "notify_chat_keys" in target:
+        keys = target.get("notify_chat_keys")
+        return keys if isinstance(keys, list) else []
+    return get_default_chat_keys()
+
+
+def resolve_telegram_chats(chat_keys=None):
+    if chat_keys is None:
+        chat_keys = get_default_chat_keys()
+
+    out = []
+    for key in chat_keys:
+        chat = get_telegram_chat(key)
+        if chat is None or not chat.get("enabled", True):
+            continue
+        # evita duplicati
+        duplicate = False
+        for current in out:
+            if current.get("key") == chat.get("key"):
+                duplicate = True
+                break
+        if not duplicate:
+            out.append(chat)
+    return out
+
+
+def notify(text, silent=False, chat_keys=None):
     if not CONFIG.get("TELEGRAM_ENABLED"):
-        return
-    try:
-        telegram_send(CONFIG["TELEGRAM_BOT_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"], text, silent=silent)
-    except Exception as e:
-        print("[TG] notify error:", repr(e))
+        return 0
+    bot_token = CONFIG.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        print("[TG] bot token not configured")
+        return 0
+
+    chats = resolve_telegram_chats(chat_keys)
+    sent = 0
+
+
+    if not chats:
+        print("[TG] no enabled/resolvable chat for this target")
+        return 0
+
+    for chat in chats:
+        key = str(chat.get("key", "?"))
+        cid = str(chat.get("chat_id", ""))
+
+        try:
+            if telegram_send(bot_token, cid, text, silent=silent):
+                sent += 1
+            else:
+                print("[TG] delivery failed ->", key)
+        except Exception as e:
+            print("[TG] notify error ->", key, repr(e))
+        gc.collect()
+        time.sleep(0.15)
+
+    return sent
 
 # =======================
 # ====== BASIC AUTH =====
@@ -484,369 +798,552 @@ def check_basic_auth(headers, now_ms):
 
 def http_response(conn, status="200 OK", ctype="text/html; charset=utf-8", body="", extra_headers=None):
     try:
-        blen = len(body) if isinstance(body, str) else len(body)
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        if body_bytes is None:
+            body_bytes = b""
         hdrs = [
             "HTTP/1.1 {}".format(status),
             "Server: PicoUptime",
             "Content-Type: {}".format(ctype),
-            "Content-Length: {}".format(blen),
+            "Content-Length: {}".format(len(body_bytes)),
             "Connection: close",
         ]
         if extra_headers:
             hdrs.extend(extra_headers)
         conn.sendall(("\r\n".join(hdrs) + "\r\n\r\n").encode())
-        if isinstance(body, str):
-            conn.sendall(body.encode())
-        else:
-            conn.sendall(body)
+        conn.sendall(body_bytes)
     except:
         pass
 
 # =======================
 # ======= WEB UI ========
 # =======================
-def render_page(targets, states, flash=""):
-    if targets is None:
-        targets = []
-    if states is None:
-        states = []
-    # costruzione righe tabella
-    rows = []
-    for i, t in enumerate(targets):
-        st   = states[i]["status"] if i < len(states) else None
-        code = states[i].get("last_code") if i < len(states) else None
-
-        # badge stato
-        if t.get("mode") == "ping":
-            if st is True:
-                badge = "🟢 UP" + ("" if code is None else " ({} ms)".format(code))
-            elif st is False:
-                badge = "🔴 DOWN (ping)"
-            else:
-                badge = "⚪ unknown"
-        else:
-            if st is True:
-                badge = "🟢 UP"
-            elif st is False:
-                badge = "🔴 DOWN" + ("" if code is None else " (HTTP {})".format(code))
-            else:
-                badge = "⚪ unknown"
-
-        # endpoint leggibile
-        if t.get("mode") == "http":
-            endpoint = html_escape(t.get("url",""))
-        elif t.get("mode") == "tcp":
-            endpoint = "{}:{}".format(html_escape(t.get("host","")), t.get("port",""))
-        else:  # ping
-            endpoint = "{} (ICMP)".format(html_escape(t.get("host","")))
-
-        # stato notifica (supporta sia 'silent' sia 'mute' per retrocompatibilità)
-        is_silent = bool(t.get("silent", t.get("mute", False)))
-        notif_html = (
-            "<a href='/notifymode?i={}'>🔊 Sonoro</a> | <span style='opacity:.5'>🔕 Silenzioso</span>"
-            if is_silent else
-            "<span style='opacity:.5'>🔊 Sonoro</span> | <a href='/notifymode?i={}'>🔕 Silenzioso</a>"
-        ).format(i)
-
-
-        # azioni
-        actions = "<a href='/test?i={}'>Test</a> | <a href='/del?i={}' onclick='return confirm(\"Eliminare?\")'>Del</a>".format(i, i)
-
-        rows.append(
-            "<tr>"
-            "<td>{}</td>"
-            "<td>{}</td>"
-            "<td><code>{}</code></td>"
-            "<td style='text-align:center'>{}</td>"
-            "<td style='text-align:center'>{}</td>"
-            "<td style='text-align:right'>{}</td>"
-            "</tr>".format(
-                html_escape(t.get("name","target")),
-                html_escape(t.get("mode","-")),
-                endpoint,
-                badge,
-                notif_html,
-                actions
-            )
-        )
-
-    flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
-
-    # pagina
-    html = """<!doctype html>
+def ui_shell(title, body):
+    template = """<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Pico Uptime</title>
-  <style>
-    body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:980px;margin:28px auto;padding:0 12px;}}
-    h1{{display:flex;align-items:center;gap:8px}}
-    table{{width:100%%;border-collapse:collapse;margin:14px 0;}}
-    th,td{{border:1px solid #ddd;padding:8px;}}
-    th{{background:#f6f6f6;text-align:left;}}
-    fieldset{{margin-top:16px;border:1px solid #ddd;}}
-    legend{{padding:0 6px;color:#444}}
-    input,select{{padding:6px;margin:4px 0;min-width:260px;}}
-    .btn{{display:inline-block;padding:8px 12px;border:1px solid #444;background:#fafafa;cursor:pointer;text-decoration:none}}
-    .flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
-    .small{{color:#666;font-size:12px}}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__ - Pico Uptime</title>
+<style>
+:root{--bg:#0b1020;--panel:#131a2a;--panel2:#182235;--line:#26334c;--text:#e9eef8;--muted:#95a3bb;--good:#3ddc97;--bad:#ff6b6b;--warn:#ffd166;--accent:#6ea8fe;--shadow:0 12px 30px rgba(0,0,0,.22)}
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:22px 14px 36px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:10px}.brand h1{font-size:22px;margin:0}.brand small{display:block;color:var(--muted);margin-top:2px}
+.logo{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:var(--panel2);border:1px solid var(--line);box-shadow:var(--shadow);font-size:22px}
+.nav{display:flex;gap:8px;flex-wrap:wrap}
+a{color:var(--accent);text-decoration:none}.btn,button{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);border-radius:9px;padding:8px 11px;background:var(--panel2);color:var(--text);text-decoration:none;cursor:pointer;font:inherit}.btn:hover,button:hover{border-color:#49658f}.btn.danger{color:#ffb0b0}.btn.good{color:#b9f5d8}
+.panel{background:rgba(19,26,42,.96);border:1px solid var(--line);border-radius:14px;padding:15px;box-shadow:var(--shadow);margin:12px 0}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px}.stat b{display:block;font-size:22px;margin-top:3px}.muted,.small{color:var(--muted);font-size:12px}
+.goodtxt{color:var(--good)}.badtxt{color:var(--bad)}.warntxt{color:var(--warn)}
+.flash{padding:11px 13px;border-radius:10px;background:#332d16;border:1px solid #62582a;color:#ffe99a;margin:10px 0}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:760px;background:var(--panel)}th,td{padding:11px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:var(--muted);font-weight:600;background:#11192a}tr:last-child td{border-bottom:0}
+.status{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:999px;font-size:12px;font-weight:700}.status.up{background:#123728;color:#8cf0bf}.status.down{background:#421d27;color:#ffb1bc}.status.unknown{background:#2d3240;color:#c1c9d7}
+.badge{display:inline-block;padding:4px 7px;border:1px solid var(--line);border-radius:999px;background:#101829;color:#c7d5ed;font-size:11px;margin:2px 3px 2px 0}.badge.off{opacity:.5}
+code{background:#0b1220;border:1px solid #202c43;border-radius:6px;padding:3px 5px;color:#dce7fa}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+label{display:block;color:#cbd6e8;font-size:13px;margin:8px 0 4px}input,select{width:100%;padding:9px 10px;border-radius:8px;border:1px solid var(--line);background:#0e1626;color:var(--text);font:inherit;outline:none}input:focus,select:focus{border-color:#557fb9}
+.checks{display:flex;gap:8px;flex-wrap:wrap}.check{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:#101829;font-size:12px}.check input{width:auto;margin:0}
+.actions{display:flex;gap:6px;flex-wrap:wrap}.section-title{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.section-title h2{font-size:17px;margin:0}
+hr{border:0;border-top:1px solid var(--line);margin:14px 0}
+@media(max-width:760px){.stats{grid-template-columns:1fr 1fr}.grid2,.grid3{grid-template-columns:1fr}.wrap{padding-top:14px}.brand h1{font-size:19px}}
+</style>
 </head>
-<body>
-
-<h1>🧭 Pico Uptime</h1>
-<p class="small">UI protetta da Basic Auth. Notifiche Telegram solo su variazione UP/DOWN. Colonna “Notifica” per Sonoro/Silenzioso per-target.</p>
-{flash}
-
-<table>
-  <thead>
-    <tr>
-      <th>Nome</th>
-      <th>Modo</th>
-      <th>Endpoint</th>
-      <th>Stato</th>
-      <th>Notifica</th>
-      <th style="text-align:right">Azioni</th>
-    </tr>
-  </thead>
-  <tbody>
-    {rows}
-  </tbody>
-</table>
-
-<fieldset>
-  <legend>Aggiungi target</legend>
-  <form action="/add" method="get" id="addForm">
-    <label>Nome<br>
-      <input type="text" name="name" placeholder="NAS HTTP">
-    </label><br>
-
-    <label>Modo<br>
-      <select name="mode" id="mode" onchange="onModeChange(this.value)">
-        <option value="http">http/https</option>
-        <option value="tcp">tcp</option>
-        <option value="ping">ping (ICMP)</option>
-      </select>
-    </label><br>
-
-    <!-- HTTP/HTTPS -->
-    <div id="httpFields">
-      <label>URL<br>
-        <input type="text" name="url" placeholder="http://10.10.99.253/">
-      </label><br>
-    </div>
-
-    <!-- TCP -->
-    <div id="tcpFields" style="display:none">
-      <label>Host<br>
-        <input type="text" name="host" placeholder="10.10.99.254">
-      </label><br>
-      <label>Porta<br>
-        <input type="number" name="port" placeholder="1883" min="1" max="65535" step="1">
-      </label><br>
-    </div>
-
-    <!-- PING -->
-    <div id="pingFields" style="display:none">
-      <label>Host<br>
-        <input type="text" name="host_ping" placeholder="10.10.99.254">
-      </label><br>
-    </div>
-
-    <button class="btn" type="submit">Aggiungi</button>
-  </form>
-</fieldset>
-
-<script>
-function onModeChange(v){{    // <-- graffe raddoppiate
-  var http = document.getElementById('httpFields');
-  var tcp  = document.getElementById('tcpFields');
-  var ping = document.getElementById('pingFields');
-
-  // toggle visibilità
-  http.style.display = (v === 'http') ? 'block' : 'none';
-  tcp.style.display  = (v === 'tcp')  ? 'block' : 'none';
-  ping.style.display = (v === 'ping') ? 'block' : 'none';
-
-  // abilita/disabilita i campi per evitare submit indesiderati
-  Array.from(http.querySelectorAll('input')).forEach(function(el){{ el.disabled = (v !== 'http'); }});
-  Array.from(tcp.querySelectorAll('input')).forEach(function(el){{ el.disabled  = (v !== 'tcp'); }});
-  Array.from(ping.querySelectorAll('input')).forEach(function(el){{ el.disabled = (v !== 'ping'); }});
-
-  // mappa host ping -> name=host solo quando serve
-  var hostPing = document.querySelector('input[name="host_ping"]');
-  if (v === 'ping') {{ hostPing.setAttribute('name','host'); }}
-  else             {{ hostPing.setAttribute('name','host_ping'); }}
-}}
-
-// inizializza allo stato corrente del select
-window.addEventListener('DOMContentLoaded', function(){{ 
-  onModeChange(document.getElementById('mode').value); 
-}});
-</script>
+<body><div class="wrap">
+<div class="top">
+  <div class="brand"><div class="logo">🧭</div><div><h1>Pico Uptime</h1><small>MicroPython monitor</small></div></div>
+  <div class="nav">
+    <a class="btn" href="/">Dashboard</a>
+    <a class="btn" href="/telegram">Telegram</a>
+    <a class="btn" href="/settings">Impostazioni</a>
+    <a class="btn danger" href="/reboot" onclick="return confirm('Riavviare il dispositivo?')">Riavvia</a>
+  </div>
+</div>
+__BODY__
+</div></body></html>"""
+    return template.replace("__TITLE__", html_escape(title)).replace("__BODY__", body)
 
 
-<p class="small">
-  Config: <a href="/telegram">/telegram</a> ·
-  Test notifiche: <a href="/notify_test">/notify_test</a> ·
-  Sistema: <a href="/reboot" onclick="return confirm('Riavviare il dispositivo?')">riavvia</a>
-</p>
+def flash_html(flash):
+    return "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
 
-<p class="small">
-Polling: ogni {ci}s — UP thr {up} / DOWN thr {dn}.
-<a href="/settings">Modifica</a>
-</p>
 
-<script>
-function onModeChange(v){{   // doppie graffe per .format
-  document.getElementById('httpFields').style.display = (v==='http') ? 'block' : 'none';
-  document.getElementById('hostFields').style.display = (v==='tcp' || v==='ping') ? 'block' : 'none';
-  document.getElementById('portField').style.display = (v==='tcp') ? 'block' : 'none';
-}}
-// init on load
-(function(){{ 
-  var sel = document.getElementById('mode');
-  if (sel) onModeChange(sel.value);
-}})();
-</script>
+def telegram_status_text():
+    if not CONFIG.get("TELEGRAM_ENABLED"):
+        return "OFF"
+    if not CONFIG.get("TELEGRAM_BOT_TOKEN"):
+        return "Token assente"
+    return "{} chat".format(len(CONFIG.get("TELEGRAM_CHATS", [])))
 
-</body>
-</html>
-""".format(
-    flash=flash_html,
-    rows="\n".join(rows),
-    ci=CONFIG["CHECK_INTERVAL"],
-    up=CONFIG["UP_THRESHOLD"],
-    dn=CONFIG["DOWN_THRESHOLD"]
-)
 
-    return html
+def chat_label(key):
+    chat = get_telegram_chat(key)
+    if chat is None:
+        return key
+    return str(chat.get("name", key))
 
-def render_notify_test_page(targets, flash=""):
-    if targets is None:
-        targets = []
+
+def render_chat_badges(target):
+    keys = target_chat_keys(target)
+    if not keys:
+        return "<span class='muted'>Nessuna</span>"
+
+    parts = []
+    for key in keys:
+        chat = get_telegram_chat(key)
+        if chat is None:
+            parts.append("<span class='badge off'>{}</span>".format(html_escape(str(key))))
+        else:
+            css = "badge" if chat.get("enabled", True) else "badge off"
+            parts.append("<span class='{}'>{}</span>".format(css, html_escape(str(chat.get("name", key)))))
+    if "notify_chat_keys" not in target:
+        parts.append("<span class='badge'>default</span>")
+    return "".join(parts)
+
+
+def render_chat_checkboxes(selected_keys=None):
+    if selected_keys is None:
+        selected_keys = get_default_chat_keys()
+
+    chats = CONFIG.get("TELEGRAM_CHATS", [])
+    if not chats:
+        return "<span class='muted'>Nessuna chat configurata. <a href='/telegram'>Aggiungine una</a>.</span>"
+
     rows = []
-    for i, t in enumerate(targets or []):
-        silent = bool(t.get("silent", False))
-        mode_label = "🔕 silenziose" if silent else "🔔 sonore"
+    for chat in chats:
+        key = str(chat.get("key", ""))
+        checked = " checked" if key in selected_keys else ""
+        state = "" if chat.get("enabled", True) else " · disattivata"
         rows.append(
-            "<tr>"
-            "<td>{}</td>"
-            "<td style='text-align:center'>{}</td>"
-            "<td style='text-align:center'>"
-            "<a href='/notify?i={}&mode=silent'>🔕 test silenziosa</a> | "
-            "<a href='/notify?i={}&mode=normal'>🔔 test sonora</a>"
-            "</td>"
-            "</tr>".format(
-                html_escape(t.get("name", "target")),
-                mode_label, i, i
+            "<label class='check'><input type='checkbox' name='chat_{}' value='1'{}> {}{}</label>".format(
+                html_escape(key), checked, html_escape(str(chat.get("name", key))), html_escape(state)
             )
         )
-    flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
-    return """<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Test notifiche - Pico Uptime</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;}}
-table{{width:100%%;border-collapse:collapse;margin:12px 0;}}
-th,td{{border:1px solid #ddd;padding:8px;}}
-th{{background:#f2f2f2;text-align:left;}}
-.flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
-.small{{color:#666;font-size:12px}}
-</style>
-</head><body>
-<h1>🔔 Test notifiche Telegram</h1>
-<p class="small">Ogni pulsante invia una notifica di test solo per il target selezionato.</p>
-{flash}
-<table>
-<thead><tr><th>Nome</th><th>Modalità corrente</th><th>Invia test</th></tr></thead>
-<tbody>
-{rows}
-</tbody>
-</table>
-<p class="small"><a href="/">← Torna alla dashboard</a></p>
-</body></html>
-""".format(flash=flash_html, rows="\n".join(rows))
+    return "<div class='checks'>{}</div>".format("".join(rows))
+
+
+def selected_chat_keys_from_params(params):
+    out = []
+    for chat in CONFIG.get("TELEGRAM_CHATS", []):
+        key = str(chat.get("key", ""))
+        if params.get("chat_" + key, "") == "1":
+            out.append(key)
+    return out
+
+
+def target_probe_signature(target):
+    """Identifica solo cio' che cambia realmente il probe di rete."""
+    mode = str(target.get("mode", ""))
+    if mode == "http":
+        return (mode, str(target.get("url", "")))
+    if mode == "tcp":
+        return (mode, str(target.get("host", "")), int(target.get("port", 0) or 0))
+    return (mode, str(target.get("host", "")))
+
+
+def target_endpoint(target):
+    if target.get("mode") == "http":
+        return str(target.get("url", ""))
+    if target.get("mode") == "tcp":
+        return "{}:{}".format(target.get("host", ""), target.get("port", ""))
+    return "{} (ICMP)".format(target.get("host", ""))
+
+
+def render_page(targets, states, flash=""):
+    targets = targets if isinstance(targets, list) else []
+    states = states if isinstance(states, list) else []
+
+    up_count = 0
+    down_count = 0
+    unknown_count = 0
+    rows = []
+
+    for i, target in enumerate(targets):
+        state = states[i] if i < len(states) else {}
+        status = state.get("status")
+        code = state.get("last_code")
+
+        if status is True:
+            up_count += 1
+            status_html = "<span class='status up'>● UP</span>"
+        elif status is False:
+            down_count += 1
+            status_html = "<span class='status down'>● DOWN</span>"
+        else:
+            unknown_count += 1
+            status_html = "<span class='status unknown'>● UNKNOWN</span>"
+
+        detail = ""
+        if target.get("mode") == "ping" and code is not None:
+            detail = "<span class='small'> {} ms</span>".format(code)
+        elif target.get("mode") == "http" and code is not None:
+            detail = "<span class='small'> HTTP {}</span>".format(code)
+
+        silent = bool(target.get("silent", False))
+        notif = "<a class='btn' href='/notifymode?i={}'>{}</a>".format(
+            i, "🔕 Silenziosa" if silent else "🔔 Sonora"
+        )
+
+        rows.append(
+            "<tr>"
+            "<td><b>{}</b><div class='small'>{}</div></td>"
+            "<td><span class='badge'>{}</span></td>"
+            "<td><code>{}</code></td>"
+            "<td>{}{}</td>"
+            "<td>{}</td>"
+            "<td>{}</td>"
+            "<td><div class='actions'>"
+            "<a class='btn' href='/test?i={}'>Verifica</a><a class='btn' href='/notify?i={}&mode=normal'>Test TG</a>"
+            "<a class='btn' href='/edit?i={}'>Modifica</a>"
+            "<a class='btn danger' href='/del?i={}' onclick='return confirm(\"Eliminare questo target?\")'>Elimina</a>"
+            "</div></td>"
+            "</tr>".format(
+                html_escape(str(target.get("name", "target"))),
+                "sonora" if not silent else "silenziosa",
+                html_escape(str(target.get("mode", "-")).upper()),
+                html_escape(target_endpoint(target)),
+                status_html, detail,
+                notif,
+                render_chat_badges(target),
+                i, i, i, i
+            )
+        )
+
+    if not rows:
+        rows.append("<tr><td colspan='7'><span class='muted'>Nessun target configurato.</span></td></tr>")
+
+    add_chat_html = render_chat_checkboxes(None)
+
+    body = """
+__FLASH__
+<div class="stats">
+  <div class="stat"><span class="muted">Online</span><b class="goodtxt">__UP__</b></div>
+  <div class="stat"><span class="muted">Offline</span><b class="badtxt">__DOWN__</b></div>
+  <div class="stat"><span class="muted">Da inizializzare</span><b>__UNKNOWN__</b></div>
+  <div class="stat"><span class="muted">Telegram</span><b>__TG__</b></div>
+</div>
+
+<div class="panel small" style="padding:9px 12px;margin:8px 0">__DIAG__</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Target monitorati</h2><span class="small">Polling __CI__s · UP __UPTH__ / DOWN __DNTH__</span></div>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Nome</th><th>Tipo</th><th>Endpoint</th><th>Stato</th><th>Avviso</th><th>Chat</th><th>Azioni</th></tr></thead>
+    <tbody>__ROWS__</tbody>
+  </table>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Aggiungi target</h2><span class="small">Le chat selezionate riceveranno UP/DOWN</span></div>
+  <form action="/add" method="get">
+    <div class="grid2">
+      <div><label>Nome</label><input name="name" required placeholder="Router sede"></div>
+      <div><label>Tipo</label>
+        <select name="mode" id="mode" onchange="modeChange(this.value)">
+          <option value="ping">PING (ICMP)</option>
+          <option value="tcp">TCP</option>
+          <option value="http">HTTP/HTTPS</option>
+        </select>
+      </div>
+    </div>
+    <div id="pingFields"><label>Host</label><input name="host_ping" placeholder="192.168.1.1"></div>
+    <div id="tcpFields" style="display:none"><div class="grid2"><div><label>Host</label><input name="host_tcp" placeholder="192.168.1.1"></div><div><label>Porta</label><input type="number" min="1" max="65535" name="port" placeholder="443"></div></div></div>
+    <div id="httpFields" style="display:none"><label>URL</label><input name="url" placeholder="https://example.org/"></div>
+    <label>Chat Telegram</label>
+    __CHAT_CHECKS__
+    <div style="margin-top:12px"><button type="submit">＋ Aggiungi target</button></div>
+  </form>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Strumenti</h2></div>
+  <div class="actions">
+    <a class="btn" href="/notify_test">Test notifiche</a>
+    <a class="btn" href="/telegram">Gestisci Telegram</a>
+    <a class="btn" href="/settings">Polling e soglie</a>
+  </div>
+</div>
+
+<script>
+function modeChange(v){
+  document.getElementById('pingFields').style.display=(v==='ping')?'block':'none';
+  document.getElementById('tcpFields').style.display=(v==='tcp')?'block':'none';
+  document.getElementById('httpFields').style.display=(v==='http')?'block':'none';
+}
+</script>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__UP__", str(up_count))
+    body = body.replace("__DOWN__", str(down_count))
+    body = body.replace("__UNKNOWN__", str(unknown_count))
+    body = body.replace("__TG__", html_escape(telegram_status_text()))
+    body = body.replace("__DIAG__", compact_diag(len(targets)))
+    body = body.replace("__CI__", str(CONFIG["CHECK_INTERVAL"]))
+    body = body.replace("__UPTH__", str(CONFIG["UP_THRESHOLD"]))
+    body = body.replace("__DNTH__", str(CONFIG["DOWN_THRESHOLD"]))
+    body = body.replace("__ROWS__", "".join(rows))
+    body = body.replace("__CHAT_CHECKS__", add_chat_html)
+    return ui_shell("Dashboard", body)
+
+
+def render_target_edit_page(index, target, flash=""):
+    selected = target_chat_keys(target)
+    mode = target.get("mode", "ping")
+
+    ping_display = "block" if mode == "ping" else "none"
+    tcp_display = "block" if mode == "tcp" else "none"
+    http_display = "block" if mode == "http" else "none"
+
+    body = """
+__FLASH__
+<div class="panel">
+  <div class="section-title"><h2>Modifica target</h2><span class="small"># __INDEX__</span></div>
+  <form action="/edit_save" method="get">
+    <input type="hidden" name="i" value="__INDEX__">
+    <div class="grid2">
+      <div><label>Nome</label><input name="name" required value="__NAME__"></div>
+      <div><label>Tipo</label>
+        <select name="mode" id="mode" onchange="modeChange(this.value)">
+          <option value="ping" __PINGSEL__>PING (ICMP)</option>
+          <option value="tcp" __TCPSEL__>TCP</option>
+          <option value="http" __HTTPSEL__>HTTP/HTTPS</option>
+        </select>
+      </div>
+    </div>
+    <div id="pingFields" style="display:__PINGDISPLAY__"><label>Host</label><input name="host_ping" value="__PINGHOST__"></div>
+    <div id="tcpFields" style="display:__TCPDISPLAY__"><div class="grid2"><div><label>Host</label><input name="host_tcp" value="__TCPHOST__"></div><div><label>Porta</label><input type="number" min="1" max="65535" name="port" value="__PORT__"></div></div></div>
+    <div id="httpFields" style="display:__HTTPDISPLAY__"><label>URL</label><input name="url" value="__URL__"></div>
+    <label>Chat Telegram</label>
+    __CHAT_CHECKS__
+    <label class="check" style="margin-top:10px;width:max-content"><input type="checkbox" name="silent" value="1" __SILENT__> Notifica silenziosa</label>
+    <div class="actions" style="margin-top:14px"><button type="submit">Salva</button><a class="btn" href="/">Annulla</a></div>
+  </form>
+</div>
+<script>
+function modeChange(v){
+  document.getElementById('pingFields').style.display=(v==='ping')?'block':'none';
+  document.getElementById('tcpFields').style.display=(v==='tcp')?'block':'none';
+  document.getElementById('httpFields').style.display=(v==='http')?'block':'none';
+}
+</script>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__INDEX__", str(index))
+    body = body.replace("__NAME__", html_escape(str(target.get("name", ""))))
+    body = body.replace("__PINGSEL__", "selected" if mode == "ping" else "")
+    body = body.replace("__TCPSEL__", "selected" if mode == "tcp" else "")
+    body = body.replace("__HTTPSEL__", "selected" if mode == "http" else "")
+    body = body.replace("__PINGDISPLAY__", ping_display)
+    body = body.replace("__TCPDISPLAY__", tcp_display)
+    body = body.replace("__HTTPDISPLAY__", http_display)
+    body = body.replace("__PINGHOST__", html_escape(str(target.get("host", ""))) if mode == "ping" else "")
+    body = body.replace("__TCPHOST__", html_escape(str(target.get("host", ""))) if mode == "tcp" else "")
+    body = body.replace("__PORT__", html_escape(str(target.get("port", ""))))
+    body = body.replace("__URL__", html_escape(str(target.get("url", ""))))
+    body = body.replace("__CHAT_CHECKS__", render_chat_checkboxes(selected))
+    body = body.replace("__SILENT__", "checked" if target.get("silent", False) else "")
+    return ui_shell("Modifica target", body)
+
+
+def render_notify_test_page(targets, flash=""):
+    targets = targets if isinstance(targets, list) else []
+    rows = []
+    for i, target in enumerate(targets):
+        keys = target_chat_keys(target)
+        chat_names = ", ".join([chat_label(k) for k in keys]) if keys else "Nessuna"
+        rows.append(
+            "<tr><td><b>{}</b></td><td>{}</td><td>{}</td>"
+            "<td><div class='actions'><a class='btn' href='/notify?i={}&mode=normal'>🔔 Sonora</a>"
+            "<a class='btn' href='/notify?i={}&mode=silent'>🔕 Silenziosa</a></div></td></tr>".format(
+                html_escape(str(target.get("name", "target"))),
+                html_escape(chat_names),
+                "Silenziosa" if target.get("silent", False) else "Sonora",
+                i, i
+            )
+        )
+    if not rows:
+        rows.append("<tr><td colspan='4'><span class='muted'>Nessun target.</span></td></tr>")
+
+    body = """
+__FLASH__
+<div class="panel">
+  <div class="section-title"><h2>Test notifiche Telegram</h2><span class="small">Il test usa le chat assegnate al target</span></div>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Target</th><th>Chat</th><th>Default target</th><th>Test</th></tr></thead>
+    <tbody>__ROWS__</tbody>
+  </table></div>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash)).replace("__ROWS__", "".join(rows))
+    return ui_shell("Test notifiche", body)
+
 
 def render_settings_page(flash=""):
-    flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
-    return """<!doctype html>
-<html><head><meta charset="utf-8"><title>Impostazioni</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;}}
-fieldset{{border:1px solid #ddd;}}
-legend{{padding:0 6px;color:#444}}
-label{{display:block;margin:8px 0 4px}}
-input{{padding:6px;min-width:160px}}
-.btn{{display:inline-block;padding:8px 12px;border:1px solid #444;background:#fafafa;cursor:pointer;text-decoration:none}}
-.flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
-.small{{color:#666;font-size:12px}}
-</style>
-</head><body>
-<h2>⚙️ Impostazioni runtime</h2>
-{flash}
-<form action="/settings" method="get">
-  <fieldset>
-    <legend>Polling & Soglie</legend>
-    <label>Intervallo di polling (secondi)</label>
-    <input type="number" name="ci" min="2" max="600" value="{ci}">
-    <label>UP_THRESHOLD (conteggi)</label>
-    <input type="number" name="up" min="1" max="10" value="{up}">
-    <label>DOWN_THRESHOLD (conteggi)</label>
-    <input type="number" name="dn" min="1" max="10" value="{dn}">
-  </fieldset>
-  <p style="margin-top:12px">
-    <button class="btn" type="submit" name="save" value="1">Salva</button>
-    <a class="btn" href="/">Annulla</a>
-  </p>
-</form>
-<p class="small">Le modifiche vengono salvate in <code>config.json</code> e applicate al volo.</p>
-</body></html>
-""".format(flash=flash_html, ci=CONFIG["CHECK_INTERVAL"], up=CONFIG["UP_THRESHOLD"], dn=CONFIG["DOWN_THRESHOLD"])
+    body = """
+__FLASH__
+<div class="panel">
+  <div class="section-title"><h2>Polling e soglie</h2><span class="small">Applicate al volo e salvate in config.json</span></div>
+  <form action="/settings" method="get">
+    <div class="grid3">
+      <div><label>Intervallo polling (secondi)</label><input type="number" name="ci" min="5" max="3600" value="__CI__"></div>
+      <div><label>UP threshold</label><input type="number" name="up" min="1" max="10" value="__UP__"></div>
+      <div><label>DOWN threshold</label><input type="number" name="dn" min="1" max="10" value="__DN__"></div>
+    </div>
+    <div class="actions" style="margin-top:14px"><button type="submit">Salva</button><a class="btn" href="/">Annulla</a></div>
+  </form>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__CI__", str(CONFIG["CHECK_INTERVAL"]))
+    body = body.replace("__UP__", str(CONFIG["UP_THRESHOLD"]))
+    body = body.replace("__DN__", str(CONFIG["DOWN_THRESHOLD"]))
+    return ui_shell("Impostazioni", body)
+
+
+def mask_chat_id(chat_id):
+    value = str(chat_id or "")
+    if len(value) <= 6:
+        return value
+    return "{}…{}".format(value[:3], value[-4:])
 
 
 def render_telegram_page(flash=""):
-    flash_html = "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
-    current_enabled = "checked" if CONFIG.get("TELEGRAM_ENABLED") else ""
-    html = """<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<title>Config Telegram - Pico Uptime</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif;max-width:900px;margin:24px auto;padding:0 12px;}}
-label{{display:block;margin:8px 0;}}
-input{{padding:6px;min-width:260px;}}
-.btn{{display:inline-block;padding:8px 12px;border:1px solid #444;background:#fafafa;cursor:pointer;margin-top:8px;text-decoration:none}}
-.flash{{padding:10px;background:#ffffcc;border:1px solid #e6db55;margin-bottom:10px}}
-.small{{color:#666;font-size:12px}}
-</style>
-</head><body>
-<h1>⚙️ Configurazione Telegram</h1>
-{flash}
-<p class="small">
-Le modifiche sono salvate in <code>telegram.json</code>. I campi lasciati vuoti non vengono modificati.
-</p>
-<form action="/telegram_save" method="get">
-  <label>
-    Bot Token (lascia vuoto per non cambiare)<br>
-    <input type="text" name="token" placeholder="nuovo bot token">
-  </label>
-  <label>
-    Chat ID (lascia vuoto per non cambiare)<br>
-    <input type="text" name="chat" placeholder="nuovo chat id">
-  </label>
-  <label>
-    <input type="checkbox" name="enabled" value="1" {enabled}> Abilita notifiche Telegram
-  </label>
-  <button class="btn" type="submit">Salva</button>
-</form>
-<p class="small"><a href="/">← Torna alla dashboard</a></p>
-</body></html>
-""".format(
-        flash=flash_html,
-        enabled=current_enabled
-    )
-    return html
+    chat_rows = []
+    defaults = get_default_chat_keys()
+
+    for chat in CONFIG.get("TELEGRAM_CHATS", []):
+        key = str(chat.get("key", ""))
+        enabled = bool(chat.get("enabled", True))
+        default_badge = "<span class='badge'>★ default</span>" if key in defaults else ""
+        state_badge = "<span class='status up'>ATTIVA</span>" if enabled else "<span class='status unknown'>OFF</span>"
+        chat_rows.append(
+            "<tr><td><b>{}</b><div class='small'>{}</div></td><td><code>{}</code></td><td>{} {}</td>"
+            "<td><div class='actions'>"
+            "<a class='btn' href='/telegram_test?key={}'>Test</a>"
+            "<a class='btn' href='/telegram_rename?key={}'>Rinomina</a>"
+            "<a class='btn' href='/telegram_toggle?key={}'>{}</a>"
+            "<a class='btn' href='/telegram_default?key={}'>{}</a>"
+            "<a class='btn danger' href='/telegram_del?key={}' onclick='return confirm(\"Rimuovere questa chat?\")'>Elimina</a>"
+            "</div></td></tr>".format(
+                html_escape(str(chat.get("name", key))),
+                html_escape(key),
+                html_escape(mask_chat_id(chat.get("chat_id", ""))),
+                state_badge, default_badge,
+                url_encode(key),
+                url_encode(key),
+                url_encode(key), "Disattiva" if enabled else "Attiva",
+                url_encode(key), "Togli default" if key in defaults else "Default",
+                url_encode(key)
+            )
+        )
+
+    if not chat_rows:
+        chat_rows.append("<tr><td colspan='4'><span class='muted'>Nessuna chat configurata.</span></td></tr>")
+
+    current_token = CONFIG.get("TELEGRAM_BOT_TOKEN", "")
+    if telegram_token_looks_valid(current_token):
+        token_state = "Configurato"
+    elif current_token:
+        token_state = "NON VALIDO"
+    else:
+        token_state = "Non configurato"
+    enabled_checked = "checked" if CONFIG.get("TELEGRAM_ENABLED") else ""
+
+    body = """
+__FLASH__
+<div class="stats">
+  <div class="stat"><span class="muted">Telegram globale</span><b>__GLOBAL__</b></div>
+  <div class="stat"><span class="muted">Bot token</span><b>__TOKENSTATE__</b></div>
+  <div class="stat"><span class="muted">Chat configurate</span><b>__CHATCOUNT__</b></div>
+  <div class="stat"><span class="muted">Chat default</span><b>__DEFAULTCOUNT__</b></div>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Bot Telegram</h2><span class="small">Il token non viene mai mostrato nella pagina</span></div>
+  <form action="/telegram_save" method="post">
+    <label>Nuovo bot token</label>
+    <input type="password" name="token" autocomplete="new-password" placeholder="Lascia vuoto per mantenere quello attuale">
+    <label class="check" style="margin-top:10px;width:max-content"><input type="checkbox" name="enabled" value="1" __ENABLEDCHECK__> Notifiche Telegram abilitate</label>
+    <div style="margin-top:12px"><button type="submit">Salva configurazione bot</button></div>
+  </form>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Chat</h2><span class="small">Una o più chat possono essere associate a ogni target</span></div>
+  <div class="tablewrap"><table>
+    <thead><tr><th>Nome</th><th>Chat ID</th><th>Stato</th><th>Azioni</th></tr></thead>
+    <tbody>__CHATROWS__</tbody>
+  </table></div>
+</div>
+
+<div class="panel">
+  <div class="section-title"><h2>Aggiungi chat</h2></div>
+  <form action="/telegram_add" method="post">
+    <div class="grid3">
+      <div><label>Nome</label><input name="name" required placeholder="NOC"></div>
+      <div><label>Chiave</label><input name="key" placeholder="noc"><span class="small">Se vuota viene generata dal nome.</span></div>
+      <div><label>Chat ID</label><input name="chat_id" required placeholder="-1001234567890"></div>
+    </div>
+    <div class="checks" style="margin-top:10px">
+      <label class="check"><input type="checkbox" name="chat_enabled" value="1" checked> Attiva</label>
+      <label class="check"><input type="checkbox" name="make_default" value="1"> Predefinita</label>
+    </div>
+    <div style="margin-top:12px"><button type="submit">＋ Aggiungi chat</button></div>
+  </form>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__GLOBAL__", "ON" if CONFIG.get("TELEGRAM_ENABLED") else "OFF")
+    body = body.replace("__TOKENSTATE__", token_state)
+    body = body.replace("__CHATCOUNT__", str(len(CONFIG.get("TELEGRAM_CHATS", []))))
+    body = body.replace("__DEFAULTCOUNT__", str(len(defaults)))
+    body = body.replace("__ENABLEDCHECK__", enabled_checked)
+    body = body.replace("__CHATROWS__", "".join(chat_rows))
+    return ui_shell("Telegram", body)
+
+
+def render_telegram_rename_page(key, flash=""):
+    chat = get_telegram_chat(key)
+    if chat is None:
+        return render_telegram_page("Chat non trovata.")
+
+    body = """
+__FLASH__
+<div class="panel">
+  <div class="section-title">
+    <h2>Rinomina chat</h2>
+    <span class="small">Cambia solo il nome visualizzato in Pico Uptime</span>
+  </div>
+
+  <div class="stats" style="margin-bottom:16px">
+    <div class="stat"><span class="muted">Chiave interna</span><b>__KEY__</b></div>
+    <div class="stat"><span class="muted">Chat ID</span><b>__CHATID__</b></div>
+  </div>
+
+  <form action="/telegram_rename_save" method="post">
+    <input type="hidden" name="key" value="__KEYVALUE__">
+
+    <label>Nome visualizzato</label>
+    <input name="name" required maxlength="48" value="__NAME__" placeholder="Nome chat">
+
+    <div class="actions" style="margin-top:14px">
+      <button type="submit">Salva nuovo nome</button>
+      <a class="btn" href="/telegram">Annulla</a>
+    </div>
+  </form>
+</div>
+"""
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__KEY__", html_escape(str(chat.get("key", key))))
+    body = body.replace("__KEYVALUE__", html_escape(str(chat.get("key", key))))
+    body = body.replace("__CHATID__", html_escape(mask_chat_id(chat.get("chat_id", ""))))
+    body = body.replace("__NAME__", html_escape(str(chat.get("name", key))))
+    return ui_shell("Rinomina chat", body)
+
 
 # =======================
 # == SERVER HTTP LOGICA ==
@@ -868,7 +1365,7 @@ def ensure_server_socket():
         s.listen(2)
         s.settimeout(0.2)
         SERVER_SOCK = s
-        print("[HTTP] listening on port", port) #<- Commenta per debug
+        print("[HTTP] listening on port", port)
         return True
     except Exception as e:
         print("[HTTP] create socket error:", repr(e))
@@ -884,48 +1381,89 @@ def ensure_server_socket():
 
 def serve_once(targets, states):
     global SERVER_SOCK
+
     if not ensure_server_socket():
         return targets, states
+
     try:
         try:
             conn, addr = SERVER_SOCK.accept()
         except OSError:
             return targets, states
+
         conn.settimeout(1.0)
 
+        # Legge almeno tutti gli header HTTP.
+        data = b""
         try:
-            data = conn.recv(1024)
+            while b"\r\n\r\n" not in data and len(data) < 4096:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
         except:
-            conn.close()
-            return targets, states
+            pass
 
         if not data:
             conn.close()
             return targets, states
 
         try:
-            line = data.split(b"\r\n", 1)[0].decode()
+            head, initial_body = data.split(b"\r\n\r\n", 1)
+        except:
+            head, initial_body = data, b""
+
+        try:
+            line = head.split(b"\r\n", 1)[0].decode()
         except:
             line = "GET / HTTP/1.1"
 
         parts = line.split(" ")
-        method = parts[0] if len(parts) > 0 else "GET"
+        method = parts[0].upper() if len(parts) > 0 else "GET"
         fullpath = parts[1] if len(parts) > 1 else "/"
+
         if "?" in fullpath:
             path, qs = fullpath.split("?", 1)
         else:
             path, qs = fullpath, ""
-        params = parse_qs(qs)
-        headers = parse_headers(data)
+
+        headers = parse_headers(head + b"\r\n\r\n")
         now_ms = time.ticks_ms()
+
+        # Per i form POST legge l'intero body urlencoded.
+        if method == "POST":
+            try:
+                content_length = int(headers.get("content-length", "0") or "0")
+            except:
+                content_length = 0
+
+            body_data = initial_body
+            try:
+                while len(body_data) < content_length:
+                    chunk = conn.recv(min(1024, content_length - len(body_data)))
+                    if not chunk:
+                        break
+                    body_data += chunk
+            except:
+                pass
+
+            try:
+                params = parse_qs(body_data[:content_length].decode())
+            except:
+                params = {}
+        else:
+            params = parse_qs(qs)
 
         def require_auth_or_deny():
             ok, status, blocked = check_basic_auth(headers, now_ms)
             if ok:
                 return True
             if status.startswith("429"):
-                http_response(conn, "429 Too Many Requests",
-                              body="Too Many Requests. Riprova tra {}s.".format(AUTH["BLOCK_SECONDS"]))
+                http_response(
+                    conn,
+                    "429 Too Many Requests",
+                    body="Too Many Requests. Riprova tra {}s.".format(AUTH["BLOCK_SECONDS"])
+                )
             else:
                 http_response(
                     conn,
@@ -935,182 +1473,453 @@ def serve_once(targets, states):
                 )
             return False
 
-        # --- ignora favicon per evitare richieste spurie ---
+        # Favicon senza contenuti e senza autenticazione.
         if path == "/favicon.ico":
             http_response(conn, "204 No Content", body="")
             conn.close()
             return targets, states
 
+        # Tutto il resto, inclusi 404 e pagine di configurazione, richiede login.
+        if not require_auth_or_deny():
+            conn.close()
+            return targets, states
+
+        if not isinstance(targets, list):
+            targets = []
+        if not isinstance(states, list):
+            states = []
+
         # ================== ROUTING ==================
         if path == "/":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            if targets is None: targets = []
-            if states is None: states = []
             http_response(conn, body=render_page(targets, states, ""))
             conn.close()
             return targets, states
 
         elif path == "/add":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            if not isinstance(targets, list):
-                targets = []
-            name = params.get("name","").strip() or "target"
-            mode = params.get("mode","http")
+            name = params.get("name", "").strip() or "target"
+            mode = params.get("mode", "ping").strip()
+            selected = selected_chat_keys_from_params(params)
+            target = {
+                "name": name,
+                "mode": mode,
+                "silent": False,
+                "notify_chat_keys": selected,
+            }
+            flash = ""
+
             if mode == "http":
-                url = params.get("url","").strip()
+                url = params.get("url", "").strip()
                 if url:
-                    targets.append({"name": name, "mode": "http", "url": url, "silent": False})
-                    save_targets(targets)
-                    states.append({"status": None, "oks": 0, "fails": 0, "last_code": None})
-                    flash = "Aggiunto target HTTP."
+                    target["url"] = url
                 else:
                     flash = "URL mancante."
             elif mode == "tcp":
-                host = params.get("host","").strip()
-                port = int(params.get("port","0") or "0")
-                if host and port > 0:
-                    targets.append({"name": name, "mode": "tcp", "host": host, "port": port, "silent": False})
-                    save_targets(targets)
-                    states.append({"status": None, "oks": 0, "fails": 0, "last_code": None})
-                    flash = "Aggiunto target TCP."
+                host = params.get("host_tcp", "").strip()
+                try:
+                    port = int(params.get("port", "0") or "0")
+                except:
+                    port = 0
+                if host and 0 < port <= 65535:
+                    target["host"] = host
+                    target["port"] = port
                 else:
-                    flash = "Host/Porta mancanti."
+                    flash = "Host o porta TCP non validi."
             elif mode == "ping":
-                host = params.get("host","").strip()
+                host = params.get("host_ping", "").strip()
                 if host:
-                    targets.append({"name": name, "mode": "ping", "host": host, "silent": False})
-                    save_targets(targets)
-                    states.append({"status": None, "oks": 0, "fails": 0, "last_code": None})
-                    flash = "Aggiunto target PING."
+                    target["host"] = host
                 else:
                     flash = "Host mancante."
             else:
-                flash = "Modo non valido."
+                flash = "Tipo target non valido."
+
+            if not flash:
+                targets.append(target)
+                save_targets(targets)
+                states.append({"status": None, "oks": 0, "fails": 0, "last_code": None})
+                flash = "Target '{}' aggiunto.".format(name)
+
             http_response(conn, body=render_page(targets, states, flash))
-            conn.close(); return targets, states
+            conn.close()
+            return targets, states
+
+        elif path == "/edit":
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
+            if 0 <= i < len(targets):
+                body = render_target_edit_page(i, targets[i], "")
+            else:
+                body = render_page(targets, states, "Indice target non valido.")
+            http_response(conn, body=body)
+            conn.close()
+            return targets, states
+
+        elif path == "/edit_save":
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
+
+            if not (0 <= i < len(targets)):
+                http_response(conn, body=render_page(targets, states, "Indice target non valido."))
+                conn.close()
+                return targets, states
+
+            old = targets[i]
+            name = params.get("name", "").strip() or old.get("name", "target")
+            mode = params.get("mode", old.get("mode", "ping")).strip()
+            selected = selected_chat_keys_from_params(params)
+            updated = {
+                "name": name,
+                "mode": mode,
+                "silent": params.get("silent", "") == "1",
+                "notify_chat_keys": selected,
+            }
+            error = ""
+
+            if mode == "http":
+                url = params.get("url", "").strip()
+                if url:
+                    updated["url"] = url
+                else:
+                    error = "URL mancante."
+            elif mode == "tcp":
+                host = params.get("host_tcp", "").strip()
+                try:
+                    port = int(params.get("port", "0") or "0")
+                except:
+                    port = 0
+                if host and 0 < port <= 65535:
+                    updated["host"] = host
+                    updated["port"] = port
+                else:
+                    error = "Host o porta TCP non validi."
+            elif mode == "ping":
+                host = params.get("host_ping", "").strip()
+                if host:
+                    updated["host"] = host
+                else:
+                    error = "Host mancante."
+            else:
+                error = "Tipo target non valido."
+
+            if error:
+                http_response(conn, body=render_target_edit_page(i, old, error))
+            else:
+                probe_changed = target_probe_signature(old) != target_probe_signature(updated)
+                targets[i] = updated
+                save_targets(targets)
+
+                # Cambiare chat, nome o modalita' sonora/silenziosa non deve
+                # riportare il monitor a UNKNOWN. Reset solo se cambia il probe.
+                if probe_changed and i < len(states):
+                    states[i] = {"status": None, "oks": 0, "fails": 0, "last_code": None}
+
+                http_response(conn, body=render_page(targets, states, "Target '{}' aggiornato.".format(name)))
+            conn.close()
+            return targets, states
 
         elif path == "/del":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            i = int(params.get("i", "-1") or "-1")
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
             if 0 <= i < len(targets):
+                name = targets[i].get("name", "target")
                 targets.pop(i)
                 save_targets(targets)
                 if i < len(states):
                     states.pop(i)
-                flash = "Target eliminato."
+                flash = "Target '{}' eliminato.".format(name)
             else:
-                flash = "Indice non valido."
+                flash = "Indice target non valido."
             http_response(conn, body=render_page(targets, states, flash))
-            conn.close(); return targets, states
+            conn.close()
+            return targets, states
 
         elif path == "/test":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            i = int(params.get("i", "-1") or "-1")
-            if 0 <= i < len(targets):
-                t = targets[i]
-                ok, code = False, None
-                if t["mode"] == "http":
-                    ok, code = check_http(t["url"])
-                elif t["mode"] == "tcp":
-                    ok = check_tcp(t["host"], t["port"])
-                else:
-                    ok, code = check_ping(t["host"])
-                if i < len(states): states[i]["last_code"] = code
-                if t["mode"] == "ping":
-                    flash = ("UP ✅" if ok else "DOWN ❌") + ("" if code is None else " ({} ms)".format(code))
-                else:
-                    flash = ("UP ✅" if ok else "DOWN ❌") + ("" if code is None else " (HTTP {})".format(code))
-            else:
-                flash = "Indice non valido."
-            http_response(conn, body=render_page(targets, states, flash))
-            conn.close(); return targets, states
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
 
-        elif path == "/notify_test":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            body = render_notify_test_page(targets)
-            http_response(conn, body=body)
-            conn.close(); return targets, states
-
-        elif path == "/notifymode":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            i = int(params.get("i", "-1") or "-1")
             if 0 <= i < len(targets):
-                t = targets[i]
-                t["silent"] = not bool(t.get("silent", False))
-                save_targets(targets)
-                flash = "Modalità notifica: {} per '{}'".format(
-                    "silenziosa" if t["silent"] else "sonora",
-                    t.get("name","target")
+                target = targets[i]
+                ok = False
+                code = None
+                if target.get("mode") == "http":
+                    ok, code = check_http(target.get("url", ""))
+                elif target.get("mode") == "tcp":
+                    ok = check_tcp(target.get("host", ""), int(target.get("port", 0)))
+                else:
+                    ok, code = check_ping(target.get("host", ""))
+
+                if i < len(states):
+                    states[i]["last_code"] = code
+
+                detail = ""
+                if target.get("mode") == "ping" and code is not None:
+                    detail = " ({} ms)".format(code)
+                elif target.get("mode") == "http" and code is not None:
+                    detail = " (HTTP {})".format(code)
+
+                flash = "Verifica manuale: {} {}{} — non modifica stato/soglie e non invia alert.".format(
+                    target.get("name", "target"),
+                    "UP ✅" if ok else "DOWN ❌",
+                    detail
                 )
             else:
-                flash = "Indice non valido."
+                flash = "Indice target non valido."
+
             http_response(conn, body=render_page(targets, states, flash))
-            conn.close(); return targets, states
+            conn.close()
+            return targets, states
+
+        elif path == "/notify_test":
+            http_response(conn, body=render_notify_test_page(targets))
+            conn.close()
+            return targets, states
+
+        elif path == "/notifymode":
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
+            if 0 <= i < len(targets):
+                target = targets[i]
+                target["silent"] = not bool(target.get("silent", False))
+                save_targets(targets)
+                flash = "Notifica {} per '{}'.".format(
+                    "silenziosa" if target["silent"] else "sonora",
+                    target.get("name", "target")
+                )
+            else:
+                flash = "Indice target non valido."
+            http_response(conn, body=render_page(targets, states, flash))
+            conn.close()
+            return targets, states
 
         elif path == "/notify":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            i = int(params.get("i", "-1") or "-1")
+            try:
+                i = int(params.get("i", "-1") or "-1")
+            except:
+                i = -1
             mode = params.get("mode", "normal")
             if 0 <= i < len(targets):
-                t = targets[i]
-                silent = (mode == "silent")
-                icon = "🔕" if silent else "🔔"
-                notify("{} Test notifica — {}".format(icon, t.get("name","target")), silent=silent)
-                body = render_notify_test_page(targets, "Notifica {} inviata per '{}'.".format(
-                    "silenziosa" if silent else "sonora", t.get("name","target")))
+                target = targets[i]
+                silent = mode == "silent"
+                keys = target_chat_keys(target)
+                sent = notify(
+                    "{} Test notifica — {}".format("🔕" if silent else "🔔", target.get("name", "target")),
+                    silent=silent,
+                    chat_keys=keys
+                )
+                flash = "Test inviato a {} chat per '{}'.".format(sent, target.get("name", "target"))
             else:
-                body = render_notify_test_page(targets, "Indice non valido.")
-            http_response(conn, body=body)
-            conn.close(); return targets, states
-
-        elif path == "/tg_toggle":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            CONFIG["TELEGRAM_ENABLED"] = not CONFIG["TELEGRAM_ENABLED"]
-            save_telegram_config()
-            flash = "Notifiche Telegram {}.".format(
-                "abilitate" if CONFIG["TELEGRAM_ENABLED"] else "disabilitate")
-            http_response(conn, body=render_page(targets, states, flash))
-            conn.close(); return targets, states
+                flash = "Indice target non valido."
+            http_response(conn, body=render_notify_test_page(targets, flash))
+            conn.close()
+            return targets, states
 
         elif path == "/telegram":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
             http_response(conn, body=render_telegram_page(""))
-            conn.close(); return targets, states
+            conn.close()
+            return targets, states
 
         elif path == "/telegram_save":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            token = params.get("token","").strip()
-            chat  = params.get("chat","").strip()
-            enabled_flag = params.get("enabled","")
+            token = params.get("token", "").strip()
             if token:
                 CONFIG["TELEGRAM_BOT_TOKEN"] = token
-            if chat:
-                CONFIG["TELEGRAM_CHAT_ID"] = chat
-            CONFIG["TELEGRAM_ENABLED"] = bool(enabled_flag)
+            CONFIG["TELEGRAM_ENABLED"] = params.get("enabled", "") == "1"
             save_telegram_config()
-            http_response(conn, body=render_telegram_page("Configurazione Telegram aggiornata."))
-            conn.close(); return targets, states
+            http_response(conn, body=render_telegram_page("Configurazione bot aggiornata."))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_add":
+            name = params.get("name", "").strip()
+            chat_id = params.get("chat_id", "").strip()
+            requested_key = params.get("key", "").strip()
+            key = normalize_chat_key(requested_key or name, "chat")
+
+            if not name or not chat_id:
+                flash = "Nome e Chat ID sono obbligatori."
+            elif get_telegram_chat(key) is not None:
+                flash = "La chiave '{}' esiste già.".format(key)
+            else:
+                chat = {
+                    "key": key,
+                    "name": name,
+                    "chat_id": chat_id,
+                    "enabled": params.get("chat_enabled", "") == "1",
+                }
+                CONFIG["TELEGRAM_CHATS"].append(chat)
+
+                defaults = get_default_chat_keys()
+                if params.get("make_default", "") == "1" or not defaults:
+                    if key not in defaults:
+                        defaults.append(key)
+                    CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+
+                save_telegram_config()
+                flash = "Chat '{}' aggiunta.".format(name)
+
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_rename":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                http_response(conn, body=render_telegram_page("Chat non trovata."))
+            else:
+                http_response(conn, body=render_telegram_rename_page(key, ""))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_rename_save":
+            key = params.get("key", "")
+            new_name = params.get("name", "").strip()
+            chat = get_telegram_chat(key)
+
+            if chat is None:
+                flash = "Chat non trovata."
+            elif not new_name:
+                http_response(conn, body=render_telegram_rename_page(key, "Il nome non può essere vuoto."))
+                conn.close()
+                return targets, states
+            else:
+                old_name = str(chat.get("name", key))
+                chat["name"] = new_name[:48]
+                save_telegram_config()
+                flash = "Chat '{}' rinominata in '{}'.".format(old_name, chat["name"])
+
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_toggle":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            else:
+                chat["enabled"] = not bool(chat.get("enabled", True))
+                save_telegram_config()
+                flash = "Chat '{}' {}.".format(
+                    chat.get("name", key),
+                    "attivata" if chat["enabled"] else "disattivata"
+                )
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_default":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            else:
+                defaults = list(CONFIG.get("TELEGRAM_DEFAULT_CHAT_KEYS", []))
+                if key in defaults:
+                    if len(defaults) <= 1:
+                        flash = "Deve rimanere almeno una chat predefinita."
+                    else:
+                        defaults.remove(key)
+                        CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+                        save_telegram_config()
+                        flash = "'{}' rimossa dalle chat predefinite.".format(chat.get("name", key))
+                else:
+                    defaults.append(key)
+                    CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+                    save_telegram_config()
+                    flash = "'{}' aggiunta alle chat predefinite.".format(chat.get("name", key))
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_del":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            else:
+                name = chat.get("name", key)
+                new_chats = []
+                for current in CONFIG.get("TELEGRAM_CHATS", []):
+                    if current.get("key") != key:
+                        new_chats.append(current)
+                CONFIG["TELEGRAM_CHATS"] = new_chats
+
+                defaults = []
+                for current_key in CONFIG.get("TELEGRAM_DEFAULT_CHAT_KEYS", []):
+                    if current_key != key:
+                        defaults.append(current_key)
+                CONFIG["TELEGRAM_DEFAULT_CHAT_KEYS"] = defaults
+
+                # Rimuove la chat anche dalle assegnazioni esplicite dei target.
+                targets_changed = False
+                for target in targets:
+                    if "notify_chat_keys" in target and isinstance(target.get("notify_chat_keys"), list):
+                        if key in target["notify_chat_keys"]:
+                            target["notify_chat_keys"].remove(key)
+                            targets_changed = True
+                if targets_changed:
+                    save_targets(targets)
+
+                save_telegram_config()
+                flash = "Chat '{}' eliminata.".format(name)
+
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        elif path == "/telegram_test":
+            key = params.get("key", "")
+            chat = get_telegram_chat(key)
+            if chat is None:
+                flash = "Chat non trovata."
+            elif not CONFIG.get("TELEGRAM_ENABLED"):
+                flash = "Telegram globale è disabilitato."
+            elif not CONFIG.get("TELEGRAM_BOT_TOKEN"):
+                flash = "Bot token non configurato."
+            else:
+                ok = telegram_send(
+                    CONFIG.get("TELEGRAM_BOT_TOKEN", ""),
+                    chat.get("chat_id", ""),
+                    "🧭 Pico Uptime — test chat '{}'".format(chat.get("name", key)),
+                    silent=False
+                )
+                flash = "Test inviato a '{}'.".format(chat.get("name", key)) if ok else "Invio test fallito."
+            http_response(conn, body=render_telegram_page(flash))
+            conn.close()
+            return targets, states
+
+        # Compatibilità con il vecchio link/toggle globale.
+        elif path == "/tg_toggle":
+            CONFIG["TELEGRAM_ENABLED"] = not CONFIG.get("TELEGRAM_ENABLED", True)
+            save_telegram_config()
+            http_response(
+                conn,
+                body=render_page(
+                    targets,
+                    states,
+                    "Telegram {}.".format("abilitato" if CONFIG["TELEGRAM_ENABLED"] else "disabilitato")
+                )
+            )
+            conn.close()
+            return targets, states
 
         elif path == "/settings":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
-            # se GET senza parametri -> mostra form
+            # GET senza parametri: mostra la pagina.
             if not params:
-                body = render_settings_page()
-                http_response(conn, body=body)
-                conn.close(); return targets, states
+                http_response(conn, body=render_settings_page(""))
+                conn.close()
+                return targets, states
 
-            # altrimenti: salvataggio valori
             try:
                 ci = int(params.get("ci", CONFIG["CHECK_INTERVAL"]))
             except:
@@ -1124,54 +1933,46 @@ def serve_once(targets, states):
             except:
                 dn = CONFIG["DOWN_THRESHOLD"]
 
-            # clamp
             ci = max(5, min(ci, 3600))
             up = max(1, min(up, 10))
             dn = max(1, min(dn, 10))
 
-            CONFIG["CHECK_INTERVAL"]  = ci
-            CONFIG["UP_THRESHOLD"]    = up
-            CONFIG["DOWN_THRESHOLD"]  = dn
+            CONFIG["CHECK_INTERVAL"] = ci
+            CONFIG["UP_THRESHOLD"] = up
+            CONFIG["DOWN_THRESHOLD"] = dn
             save_runtime_config()
 
-            flash = "Impostazioni salvate: intervallo {}s, UP={}, DOWN={}.".format(ci, up, dn)
-            http_response(conn, body=render_page(targets, states, flash))
-            conn.close(); return targets, states
+            flash = "Impostazioni salvate: polling {}s, UP {}, DOWN {}.".format(ci, up, dn)
+            http_response(conn, body=render_settings_page(flash))
+            conn.close()
+            return targets, states
 
         elif path == "/reboot":
-            if not require_auth_or_deny():
-                conn.close(); return targets, states
             http_response(conn, body="Reboot in corso… fra 2 secondi.")
-            try: conn.close()
-            except: pass
-            try: notify("♻️ Reboot richiesto dalla web UI.", silent=True)
-            except: pass
             try:
-                global SERVER_SOCK
-                if SERVER_SOCK: SERVER_SOCK.close()
-            except: pass
+                conn.close()
+            except:
+                pass
+            try:
+                notify("♻️ Reboot richiesto dalla web UI.", silent=True)
+            except:
+                pass
+            try:
+                if SERVER_SOCK:
+                    SERVER_SOCK.close()
+            except:
+                pass
             SERVER_SOCK = None
             try:
-                wlan = network.WLAN(network.STA_IF); wlan.active(False)
-            except: pass
+                wlan = network.WLAN(network.STA_IF)
+                wlan.active(False)
+            except:
+                pass
             time.sleep(2)
             machine.reset()
 
-        # --- Fallback 404 per QUALSIASI altra rotta ---
         http_response(conn, "404 Not Found", body="Not Found")
         conn.close()
-        return targets, states
-
-    except Exception as e:
-        print("[HTTP] serve error:", repr(e))
-        try:
-            if SERVER_SOCK:
-                SERVER_SOCK.close()
-        except:
-            pass
-        SERVER_SOCK = None
-        gc.collect()
-        time.sleep(0.1)
         return targets, states
 
     except Exception as e:
@@ -1190,6 +1991,7 @@ def serve_once(targets, states):
 # ===== MAIN LOOP =======
 # =======================
 def main():
+    global LAST_POLL_UPTIME_MS
     print("[PicoUptime] starting...")
     while not wifi_connect(CONFIG["WIFI_SSID"], CONFIG["WIFI_PASSWORD"]):
         time.sleep(3)
@@ -1198,21 +2000,21 @@ def main():
     load_telegram_config()
 
     targets = load_targets()
-    print("[DEBUG] targets dopo load:", targets)  #<- Commenta per debug
-    print("[DEBUG] targets type:", type(targets))  #<- Commenta per debug
-    
+
+
+    # Fallback di sicurezza se targets.json non è valido.
     if targets is None or not isinstance(targets, list):
         print("[CFG] targets is None or invalid, using empty list")
         targets = []
-    
+
     states = [{"status": None, "oks": 0, "fails": 0, "last_code": None} for _ in targets]
-    print("[DEBUG] states inizializzati:", len(states))  #<- Commenta per debug
 
 
     last_check_ms = time.ticks_ms()
     wifi_fail_count = 0
 
     while True:
+        runtime_tick()
         wlan = network.WLAN(network.STA_IF)
         if not wlan.isconnected():
             wifi_fail_count += 1
@@ -1261,11 +2063,26 @@ def main():
                     if prev is None:
                         if states[i]["oks"] >= CONFIG["UP_THRESHOLD"]:
                             states[i]["status"] = True
+                            keys = target_chat_keys(t)
+                            print("[MON] UNKNOWN -> UP:", t.get("name", "servizio"), "chat:", keys)
+                            notify(
+                                "✅ {} è ONLINE".format(t.get("name", "servizio")),
+                                silent=silent,
+                                chat_keys=keys
+                            )
+
                         continue
 
                     if prev is False and states[i]["oks"] >= CONFIG["UP_THRESHOLD"]:
                         states[i]["status"] = True
-                        notify("✅ {} è ONLINE".format(t.get("name", "servizio")), silent=silent)
+                        keys = target_chat_keys(t)
+                        print("[MON] DOWN -> UP:", t.get("name", "servizio"), "chat:", keys)
+                        notify(
+                            "✅ {} è ONLINE".format(t.get("name", "servizio")),
+                            silent=silent,
+                            chat_keys=keys
+                        )
+
 
                 else:
                     states[i]["fails"] += 1
@@ -1274,11 +2091,28 @@ def main():
                     if prev is None:
                         if states[i]["fails"] >= CONFIG["DOWN_THRESHOLD"]:
                             states[i]["status"] = False
+                            keys = target_chat_keys(t)
+                            print("[MON] UNKNOWN -> DOWN:", t.get("name", "servizio"), "chat:", keys)
+                            notify(
+                                "❌ {} è OFFLINE".format(t.get("name", "servizio")),
+                                silent=silent,
+                                chat_keys=keys
+                            )
+
                         continue
 
                     if prev is True and states[i]["fails"] >= CONFIG["DOWN_THRESHOLD"]:
                         states[i]["status"] = False
-                        notify("❌ {} è OFFLINE".format(t.get("name", "servizio")), silent=silent)
+                        keys = target_chat_keys(t)
+                        print("[MON] UP -> DOWN:", t.get("name", "servizio"), "chat:", keys)
+                        notify(
+                            "❌ {} è OFFLINE".format(t.get("name", "servizio")),
+                            silent=silent,
+                            chat_keys=keys
+                        )
+
+
+            LAST_POLL_UPTIME_MS = runtime_tick()
 
         time.sleep(0.05)
 
@@ -1292,5 +2126,3 @@ except Exception as e:
         print("[FATAL] eccezione fuori da main:", repr(e))
     except:
         pass
-    time.sleep(2)      #<- Commenta per debug
-    machine.reset()    #<- Commenta per debug
