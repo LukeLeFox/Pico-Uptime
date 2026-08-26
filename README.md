@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi%20Pico%20W-orange.svg)]()
 [![Language](https://img.shields.io/badge/language-MicroPython-blue.svg)]()
-[![Version](https://img.shields.io/badge/version-1.1.9-blue.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.14-blue.svg)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)]()
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)]()
 
@@ -13,10 +13,11 @@ Il progetto è volutamente leggero: nessun framework web, nessun database e ness
 ## Funzionalità
 
 - **Monitoraggio multiprotocollo**: HTTP/HTTPS, TCP e Ping ICMP con RTT.
-- **Dashboard web responsive** con stato UP/DOWN/UNKNOWN, aggiunta/modifica/eliminazione target e test manuale.
+- **Dashboard web responsive low-memory** con diagnostica, stato UP/DOWN/UNKNOWN e comandi nella barra superiore.
 - **Diagnostica compatta**: uptime, RSSI Wi-Fi, IP, RAM libera, numero target e ultimo polling.
 - **Telegram multi-chat**: più chat con un singolo bot, una o più chat per target, chat predefinite, test e rinomina.
 - **Notifiche sonore/silenziose per target**.
+- **Retry Telegram affidabile**: una notifica di transizione non consegnata viene ritentata senza duplicare le chat già raggiunte.
 - **Polling persistente** con intervallo e soglie UP/DOWN configurabili da browser.
 - **Persistenza JSON** tramite `config.json`, `targets.json` e `telegram.json`.
 - **Basic Auth** su tutta l'interfaccia con blocco temporaneo dopo login falliti.
@@ -125,6 +126,7 @@ Esempio `config.json`:
 | Endpoint | Funzione |
 |---|---|
 | `/` | Dashboard |
+| `/add_page` | Pagina di aggiunta target |
 | `/add` | Aggiunge un target |
 | `/edit?i=X` | Modifica un target |
 | `/del?i=X` | Elimina un target |
@@ -147,7 +149,7 @@ SSID, password Wi-Fi e hash della password web vanno configurati localmente prim
 
 ## Note sulle risorse
 
-Pico Uptime gira su un microcontrollore con RAM limitata. La diagnostica è volutamente una singola barra compatta per evitare grosse allocazioni HTML durante il rendering.
+Pico Uptime gira su un microcontrollore con RAM limitata. La home contiene soltanto diagnostica e target monitorati; i form sono separati in sottopagine per ridurre le allocazioni HTML durante il rendering.
 
 ## License
 

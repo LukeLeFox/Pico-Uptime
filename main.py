@@ -1,4 +1,4 @@
-# main.py — Pico Uptime v1.1.9 (Raspberry Pi Pico W, MicroPython)
+# main.py — Pico Uptime v1.1.14 low-memory (Raspberry Pi Pico W, MicroPython)
 # - Web UI con Basic Auth
 # - Monitor HTTP / TCP / PING (ICMP)
 # - Notifiche Telegram multi-chat su variazioni UP/DOWN
@@ -28,6 +28,10 @@ LED = machine.Pin("LED", machine.Pin.OUT)
 APP_UPTIME_MS = 0
 APP_LAST_TICK_MS = time.ticks_ms()
 LAST_POLL_UPTIME_MS = None
+
+# Retry notifiche Telegram fallite.
+# Una sola pending per target; una nuova transizione sostituisce la precedente.
+NOTIFY_RETRY_MS = 60 * 1000
 
 
 def runtime_tick():
@@ -80,7 +84,7 @@ def compact_diag(target_count):
         poll = "{} fa".format(fmt_age(max(0, now_ms - LAST_POLL_UPTIME_MS)))
 
     return (
-        "<b>Sistema</b> · uptime {} · Wi-Fi {} · IP {} · RAM {} · "
+        "<b>Info sistema</b> · uptime {} · Wi-Fi {} · IP {} · RAM {} · "
         "{} target · ultimo polling {}"
     ).format(
         fmt_age(now_ms), html_escape(rssi), html_escape(str(ip)),
@@ -745,6 +749,91 @@ def notify(text, silent=False, chat_keys=None):
 
     return sent
 
+
+def send_transition_notification(text, silent=False, chat_keys=None):
+    """Invia una transizione e restituisce solo le chat che hanno fallito."""
+    if not CONFIG.get("TELEGRAM_ENABLED"):
+        return []
+
+    bot_token = CONFIG.get("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        print("[TG] bot token not configured")
+        return []
+
+    chats = resolve_telegram_chats(chat_keys)
+    if not chats:
+        return []
+
+    failed_keys = []
+    for chat in chats:
+        key = str(chat.get("key", "?"))
+        cid = str(chat.get("chat_id", ""))
+        try:
+            if not telegram_send(bot_token, cid, text, silent=silent):
+                failed_keys.append(key)
+        except Exception as e:
+            print("[TG] notify error ->", key, repr(e))
+            failed_keys.append(key)
+        gc.collect()
+        time.sleep(0.15)
+
+    return failed_keys
+
+
+def queue_transition_notification(state, text, silent, chat_keys):
+    """Prova subito l'invio e accoda solo le chat fallite."""
+    failed_keys = send_transition_notification(text, silent=silent, chat_keys=chat_keys)
+
+    if failed_keys:
+        state["pending_notify"] = {
+            "text": text,
+            "silent": bool(silent),
+            "chat_keys": failed_keys,
+            "next_retry_ms": time.ticks_add(time.ticks_ms(), NOTIFY_RETRY_MS),
+        }
+        print("[TG] notification pending for retry:", failed_keys)
+    else:
+        state.pop("pending_notify", None)
+
+
+def process_pending_notifications(targets, states):
+    """Ritenta ogni 60s, al massimo una pending per target."""
+    if not isinstance(states, list):
+        return
+
+    now = time.ticks_ms()
+    for i in range(len(states)):
+        state = states[i]
+        if not isinstance(state, dict):
+            continue
+
+        pending = state.get("pending_notify")
+        if not isinstance(pending, dict):
+            continue
+
+        next_retry_ms = pending.get("next_retry_ms")
+        if next_retry_ms is not None and time.ticks_diff(now, next_retry_ms) < 0:
+            continue
+
+        failed_keys = send_transition_notification(
+            pending.get("text", ""),
+            silent=bool(pending.get("silent", False)),
+            chat_keys=pending.get("chat_keys", [])
+        )
+
+        if failed_keys:
+            pending["chat_keys"] = failed_keys
+            pending["next_retry_ms"] = time.ticks_add(now, NOTIFY_RETRY_MS)
+        else:
+            state.pop("pending_notify", None)
+            name = "target"
+            if isinstance(targets, list) and i < len(targets):
+                try:
+                    name = targets[i].get("name", "target")
+                except:
+                    pass
+            print("[TG] pending notification delivered:", name)
+
 # =======================
 # ====== BASIC AUTH =====
 # =======================
@@ -818,7 +907,19 @@ def http_response(conn, status="200 OK", ctype="text/html; charset=utf-8", body=
 # =======================
 # ======= WEB UI ========
 # =======================
-def ui_shell(title, body):
+def ui_shell(title, body, dashboard_tools=False):
+    if dashboard_tools:
+        nav_extra = (
+            '<a class="btn" href="/add_page">Aggiungi target</a>'
+            '<a class="btn" href="/telegram">Gestisci Telegram</a>'
+            '<a class="btn" href="/settings">Polling e soglie</a>'
+            '<a class="btn" href="/notify_test">Test notifiche</a>'
+            '<a class="btn danger" href="/reboot" '
+            'onclick="return confirm(\'Riavviare il dispositivo?\')">Reboot</a>'
+        )
+    else:
+        nav_extra = ""
+
     template = """<!doctype html>
 <html>
 <head>
@@ -829,15 +930,13 @@ def ui_shell(title, body):
 :root{--bg:#0b1020;--panel:#131a2a;--panel2:#182235;--line:#26334c;--text:#e9eef8;--muted:#95a3bb;--good:#3ddc97;--bad:#ff6b6b;--warn:#ffd166;--accent:#6ea8fe;--shadow:0 12px 30px rgba(0,0,0,.22)}
 *{box-sizing:border-box}
 body{margin:0;background:#000;color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}
-.wrap{max-width:1080px;margin:0 auto;padding:22px 14px 36px}
-.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
-.brand{display:flex;align-items:center;gap:10px}.brand h1{font-size:22px;margin:0}.brand small{display:block;color:var(--muted);margin-top:2px}
-.logo{width:42px;height:42px;display:grid;place-items:center;border-radius:12px;background:var(--panel2);border:1px solid var(--line);box-shadow:var(--shadow);font-size:22px}
+.wrap{max-width:1080px;margin:0 auto;padding:18px 14px 30px}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.brand h1{font-size:20px;margin:0}.brand small{display:block;color:var(--muted);margin-top:2px}
 .nav{display:flex;gap:8px;flex-wrap:wrap}
 a{color:var(--accent);text-decoration:none}.btn,button{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);border-radius:9px;padding:8px 11px;background:var(--panel2);color:var(--text);text-decoration:none;cursor:pointer;font:inherit}.btn:hover,button:hover{border-color:#49658f}.btn.danger{color:#ffb0b0}.btn.good{color:#b9f5d8}
 .panel{background:rgba(19,26,42,.96);border:1px solid var(--line);border-radius:14px;padding:15px;box-shadow:var(--shadow);margin:12px 0}
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:12px 0}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px}.stat b{display:block;font-size:22px;margin-top:3px}.muted,.small{color:var(--muted);font-size:12px}
-.goodtxt{color:var(--good)}.badtxt{color:var(--bad)}.warntxt{color:var(--warn)}
+.muted,.small{color:var(--muted);font-size:12px}
 .flash{padding:11px 13px;border-radius:10px;background:#332d16;border:1px solid #62582a;color:#ffe99a;margin:10px 0}
 .tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:760px;background:var(--panel)}th,td{padding:11px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:var(--muted);font-weight:600;background:#11192a}tr:last-child td{border-bottom:0}
 .status{display:inline-flex;align-items:center;gap:6px;padding:5px 8px;border-radius:999px;font-size:12px;font-weight:700}.status.up{background:#123728;color:#8cf0bf}.status.down{background:#421d27;color:#ffb1bc}.status.unknown{background:#2d3240;color:#c1c9d7}
@@ -848,34 +947,31 @@ label{display:block;color:#cbd6e8;font-size:13px;margin:8px 0 4px}input,select{w
 .checks{display:flex;gap:8px;flex-wrap:wrap}.check{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:#101829;font-size:12px}.check input{width:auto;margin:0}
 .actions{display:flex;gap:6px;flex-wrap:wrap}.section-title{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px}.section-title h2{font-size:17px;margin:0}
 hr{border:0;border-top:1px solid var(--line);margin:14px 0}
-@media(max-width:760px){.stats{grid-template-columns:1fr 1fr}.grid2,.grid3{grid-template-columns:1fr}.wrap{padding-top:14px}.brand h1{font-size:19px}}
+@media(max-width:700px){.grid2,.grid3{grid-template-columns:1fr}.wrap{padding:12px 8px 24px}}
 </style>
 </head>
-<body><div class="wrap">
-<div class="top">
-  <div class="brand"><div class="logo">🧭</div><div><h1>Pico Uptime</h1><small>MicroPython monitor</small></div></div>
-  <div class="nav">
-    <a class="btn" href="/">Dashboard</a>
-    <a class="btn" href="/telegram">Telegram</a>
-    <a class="btn" href="/settings">Impostazioni</a>
-    <a class="btn danger" href="/reboot" onclick="return confirm('Riavviare il dispositivo?')">Riavvia</a>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">
+      <div><h1>Pico Uptime</h1><small>MicroPython monitor</small></div>
+    </div>
+    <div class="nav">
+      <a class="btn" href="/">Dashboard</a>
+      __NAV_EXTRA__
+    </div>
   </div>
+  __BODY__
 </div>
-__BODY__
-</div></body></html>"""
+</body>
+</html>
+"""
+    template = template.replace("__NAV_EXTRA__", nav_extra)
     return template.replace("__TITLE__", html_escape(title)).replace("__BODY__", body)
 
 
 def flash_html(flash):
     return "" if not flash else "<div class='flash'>{}</div>".format(html_escape(flash))
-
-
-def telegram_status_text():
-    if not CONFIG.get("TELEGRAM_ENABLED"):
-        return "OFF"
-    if not CONFIG.get("TELEGRAM_BOT_TOKEN"):
-        return "Token assente"
-    return "{} chat".format(len(CONFIG.get("TELEGRAM_CHATS", [])))
 
 
 def chat_label(key):
@@ -897,7 +993,9 @@ def render_chat_badges(target):
             parts.append("<span class='badge off'>{}</span>".format(html_escape(str(key))))
         else:
             css = "badge" if chat.get("enabled", True) else "badge off"
-            parts.append("<span class='{}'>{}</span>".format(css, html_escape(str(chat.get("name", key)))))
+            parts.append("<span class='{}'>{}</span>".format(
+                css, html_escape(str(chat.get("name", key)))
+            ))
     if "notify_chat_keys" not in target:
         parts.append("<span class='badge'>default</span>")
     return "".join(parts)
@@ -909,7 +1007,10 @@ def render_chat_checkboxes(selected_keys=None):
 
     chats = CONFIG.get("TELEGRAM_CHATS", [])
     if not chats:
-        return "<span class='muted'>Nessuna chat configurata. <a href='/telegram'>Aggiungine una</a>.</span>"
+        return (
+            "<span class='muted'>Nessuna chat configurata. "
+            "<a href='/telegram'>Aggiungine una</a>.</span>"
+        )
 
     rows = []
     for chat in chats:
@@ -917,8 +1018,12 @@ def render_chat_checkboxes(selected_keys=None):
         checked = " checked" if key in selected_keys else ""
         state = "" if chat.get("enabled", True) else " · disattivata"
         rows.append(
-            "<label class='check'><input type='checkbox' name='chat_{}' value='1'{}> {}{}</label>".format(
-                html_escape(key), checked, html_escape(str(chat.get("name", key))), html_escape(state)
+            "<label class='check'><input type='checkbox' name='chat_{}' "
+            "value='1'{}> {}{}</label>".format(
+                html_escape(key),
+                checked,
+                html_escape(str(chat.get("name", key))),
+                html_escape(state)
             )
         )
     return "<div class='checks'>{}</div>".format("".join(rows))
@@ -939,7 +1044,11 @@ def target_probe_signature(target):
     if mode == "http":
         return (mode, str(target.get("url", "")))
     if mode == "tcp":
-        return (mode, str(target.get("host", "")), int(target.get("port", 0) or 0))
+        return (
+            mode,
+            str(target.get("host", "")),
+            int(target.get("port", 0) or 0)
+        )
     return (mode, str(target.get("host", "")))
 
 
@@ -952,39 +1061,25 @@ def target_endpoint(target):
 
 
 def render_page(targets, states, flash=""):
-    targets = targets if isinstance(targets, list) else []
-    states = states if isinstance(states, list) else []
-
-    up_count = 0
-    down_count = 0
-    unknown_count = 0
     rows = []
 
-    for i, target in enumerate(targets):
-        state = states[i] if i < len(states) else {}
-        status = state.get("status")
-        code = state.get("last_code")
+    for i, t in enumerate(targets):
+        s = states[i] if i < len(states) else {"status": None, "last_code": None}
+        st = s.get("status")
+        code = s.get("last_code")
 
-        if status is True:
-            up_count += 1
-            status_html = "<span class='status up'>● UP</span>"
-        elif status is False:
-            down_count += 1
-            status_html = "<span class='status down'>● DOWN</span>"
+        if st is True:
+            state_html = "<span class='status up'>● UP</span>"
+        elif st is False:
+            state_html = "<span class='status down'>● DOWN</span>"
         else:
-            unknown_count += 1
-            status_html = "<span class='status unknown'>● UNKNOWN</span>"
+            state_html = "<span class='status unknown'>● UNKNOWN</span>"
 
         detail = ""
-        if target.get("mode") == "ping" and code is not None:
+        if t.get("mode") == "ping" and code is not None:
             detail = "<span class='small'> {} ms</span>".format(code)
-        elif target.get("mode") == "http" and code is not None:
+        elif t.get("mode") == "http" and code is not None:
             detail = "<span class='small'> HTTP {}</span>".format(code)
-
-        silent = bool(target.get("silent", False))
-        notif = "<a class='btn' href='/notifymode?i={}'>{}</a>".format(
-            i, "🔕 Silenziosa" if silent else "🔔 Sonora"
-        )
 
         rows.append(
             "<tr>"
@@ -993,56 +1088,77 @@ def render_page(targets, states, flash=""):
             "<td><code>{}</code></td>"
             "<td>{}{}</td>"
             "<td>{}</td>"
-            "<td>{}</td>"
             "<td><div class='actions'>"
-            "<a class='btn' href='/test?i={}'>Verifica</a><a class='btn' href='/notify?i={}&mode=normal'>Test TG</a>"
+            "<a class='btn' href='/test?i={}'>Verifica</a>"
+            "<a class='btn' href='/notify?i={}&mode=normal'>Test TG</a>"
             "<a class='btn' href='/edit?i={}'>Modifica</a>"
             "<a class='btn danger' href='/del?i={}' onclick='return confirm(\"Eliminare questo target?\")'>Elimina</a>"
             "</div></td>"
             "</tr>".format(
-                html_escape(str(target.get("name", "target"))),
-                "sonora" if not silent else "silenziosa",
-                html_escape(str(target.get("mode", "-")).upper()),
-                html_escape(target_endpoint(target)),
-                status_html, detail,
-                notif,
-                render_chat_badges(target),
+                html_escape(str(t.get("name", "target"))),
+                "silenziosa" if t.get("silent", False) else "sonora",
+                html_escape(str(t.get("mode", "-")).upper()),
+                html_escape(target_endpoint(t)),
+                state_html,
+                detail,
+                render_chat_badges(t),
                 i, i, i, i
             )
         )
 
     if not rows:
-        rows.append("<tr><td colspan='7'><span class='muted'>Nessun target configurato.</span></td></tr>")
-
-    add_chat_html = render_chat_checkboxes(None)
+        rows_html = "<tr><td colspan='6'><span class='muted'>Nessun target configurato.</span></td></tr>"
+    else:
+        rows_html = "".join(rows)
 
     body = """
 __FLASH__
-<div class="stats">
-  <div class="stat"><span class="muted">Online</span><b class="goodtxt">__UP__</b></div>
-  <div class="stat"><span class="muted">Offline</span><b class="badtxt">__DOWN__</b></div>
-  <div class="stat"><span class="muted">Da inizializzare</span><b>__UNKNOWN__</b></div>
-  <div class="stat"><span class="muted">Telegram</span><b>__TG__</b></div>
-</div>
 
 <div class="panel small" style="padding:9px 12px;margin:8px 0">__DIAG__</div>
 
 <div class="panel">
-  <div class="section-title"><h2>Target monitorati</h2><span class="small">Polling __CI__s · UP __UPTH__ / DOWN __DNTH__</span></div>
+  <div class="section-title">
+    <h2>Target monitorati</h2>
+    <span class="small">Polling __CI__s · UP __UPTH__ / DOWN __DNTH__</span>
+  </div>
   <div class="tablewrap">
-  <table>
-    <thead><tr><th>Nome</th><th>Tipo</th><th>Endpoint</th><th>Stato</th><th>Avviso</th><th>Chat</th><th>Azioni</th></tr></thead>
-    <tbody>__ROWS__</tbody>
-  </table>
+    <table>
+      <thead>
+        <tr>
+          <th>Nome</th><th>Tipo</th><th>Endpoint</th><th>Stato</th><th>Chat</th><th>Azioni</th>
+        </tr>
+      </thead>
+      <tbody>__ROWS__</tbody>
+    </table>
   </div>
 </div>
 
+"""
+
+    body = body.replace("__FLASH__", flash_html(flash))
+    body = body.replace("__DIAG__", compact_diag(len(targets)))
+    body = body.replace("__CI__", str(CONFIG["CHECK_INTERVAL"]))
+    body = body.replace("__UPTH__", str(CONFIG["UP_THRESHOLD"]))
+    body = body.replace("__DNTH__", str(CONFIG["DOWN_THRESHOLD"]))
+    body = body.replace("__ROWS__", rows_html)
+
+    return ui_shell("Dashboard", body, True)
+
+
+def render_add_target_page(flash=""):
+    body = """
+__FLASH__
 <div class="panel">
-  <div class="section-title"><h2>Aggiungi target</h2><span class="small">Le chat selezionate riceveranno UP/DOWN</span></div>
+  <div class="section-title"><h2>Aggiungi target</h2></div>
+
   <form action="/add" method="get">
     <div class="grid2">
-      <div><label>Nome</label><input name="name" required placeholder="Router sede"></div>
-      <div><label>Tipo</label>
+      <div>
+        <label>Nome</label>
+        <input name="name" required placeholder="Router sede">
+      </div>
+      <div>
+        <label>Tipo</label>
         <select name="mode" id="mode" onchange="modeChange(this.value)">
           <option value="ping">PING (ICMP)</option>
           <option value="tcp">TCP</option>
@@ -1050,22 +1166,31 @@ __FLASH__
         </select>
       </div>
     </div>
-    <div id="pingFields"><label>Host</label><input name="host_ping" placeholder="192.168.1.1"></div>
-    <div id="tcpFields" style="display:none"><div class="grid2"><div><label>Host</label><input name="host_tcp" placeholder="192.168.1.1"></div><div><label>Porta</label><input type="number" min="1" max="65535" name="port" placeholder="443"></div></div></div>
-    <div id="httpFields" style="display:none"><label>URL</label><input name="url" placeholder="https://example.org/"></div>
-    <label>Chat Telegram</label>
-    __CHAT_CHECKS__
-    <div style="margin-top:12px"><button type="submit">＋ Aggiungi target</button></div>
-  </form>
-</div>
 
-<div class="panel">
-  <div class="section-title"><h2>Strumenti</h2></div>
-  <div class="actions">
-    <a class="btn" href="/notify_test">Test notifiche</a>
-    <a class="btn" href="/telegram">Gestisci Telegram</a>
-    <a class="btn" href="/settings">Polling e soglie</a>
-  </div>
+    <div id="pingFields">
+      <label>Host</label>
+      <input name="host_ping" placeholder="192.168.1.1">
+    </div>
+
+    <div id="tcpFields" style="display:none">
+      <div class="grid2">
+        <div><label>Host</label><input name="host_tcp" placeholder="192.168.1.1"></div>
+        <div><label>Porta</label><input type="number" min="1" max="65535" name="port" placeholder="443"></div>
+      </div>
+    </div>
+
+    <div id="httpFields" style="display:none">
+      <label>URL</label>
+      <input name="url" placeholder="https://example.org/">
+    </div>
+
+    <label>Chat Telegram</label>
+    __CHATS__
+
+    <div style="margin-top:12px">
+      <button type="submit">Aggiungi target</button>
+    </div>
+  </form>
 </div>
 
 <script>
@@ -1077,18 +1202,8 @@ function modeChange(v){
 </script>
 """
     body = body.replace("__FLASH__", flash_html(flash))
-    body = body.replace("__UP__", str(up_count))
-    body = body.replace("__DOWN__", str(down_count))
-    body = body.replace("__UNKNOWN__", str(unknown_count))
-    body = body.replace("__TG__", html_escape(telegram_status_text()))
-    body = body.replace("__DIAG__", compact_diag(len(targets)))
-    body = body.replace("__CI__", str(CONFIG["CHECK_INTERVAL"]))
-    body = body.replace("__UPTH__", str(CONFIG["UP_THRESHOLD"]))
-    body = body.replace("__DNTH__", str(CONFIG["DOWN_THRESHOLD"]))
-    body = body.replace("__ROWS__", "".join(rows))
-    body = body.replace("__CHAT_CHECKS__", add_chat_html)
-    return ui_shell("Dashboard", body)
-
+    body = body.replace("__CHATS__", render_chat_checkboxes(None))
+    return ui_shell("Aggiungi target", body)
 
 def render_target_edit_page(index, target, flash=""):
     selected = target_chat_keys(target)
@@ -1492,6 +1607,11 @@ def serve_once(targets, states):
         # ================== ROUTING ==================
         if path == "/":
             http_response(conn, body=render_page(targets, states, ""))
+            conn.close()
+            return targets, states
+
+        elif path == "/add_page":
+            http_response(conn, body=render_add_target_page(""))
             conn.close()
             return targets, states
 
@@ -2014,7 +2134,6 @@ def main():
     wifi_fail_count = 0
 
     while True:
-        runtime_tick()
         wlan = network.WLAN(network.STA_IF)
         if not wlan.isconnected():
             wifi_fail_count += 1
@@ -2029,6 +2148,9 @@ def main():
             wifi_fail_count = 0
 
         targets, states = serve_once(targets, states)
+
+        # Retry eventuali notifiche di transizione non consegnate.
+        process_pending_notifications(targets, states)
 
         now = time.ticks_ms()
         interval_ms = CONFIG["CHECK_INTERVAL"] * 1000
@@ -2065,10 +2187,11 @@ def main():
                             states[i]["status"] = True
                             keys = target_chat_keys(t)
                             print("[MON] UNKNOWN -> UP:", t.get("name", "servizio"), "chat:", keys)
-                            notify(
+                            queue_transition_notification(
+                                states[i],
                                 "✅ {} è ONLINE".format(t.get("name", "servizio")),
-                                silent=silent,
-                                chat_keys=keys
+                                silent,
+                                keys
                             )
 
                         continue
@@ -2077,10 +2200,11 @@ def main():
                         states[i]["status"] = True
                         keys = target_chat_keys(t)
                         print("[MON] DOWN -> UP:", t.get("name", "servizio"), "chat:", keys)
-                        notify(
+                        queue_transition_notification(
+                            states[i],
                             "✅ {} è ONLINE".format(t.get("name", "servizio")),
-                            silent=silent,
-                            chat_keys=keys
+                            silent,
+                            keys
                         )
 
 
@@ -2093,10 +2217,11 @@ def main():
                             states[i]["status"] = False
                             keys = target_chat_keys(t)
                             print("[MON] UNKNOWN -> DOWN:", t.get("name", "servizio"), "chat:", keys)
-                            notify(
+                            queue_transition_notification(
+                                states[i],
                                 "❌ {} è OFFLINE".format(t.get("name", "servizio")),
-                                silent=silent,
-                                chat_keys=keys
+                                silent,
+                                keys
                             )
 
                         continue
@@ -2105,10 +2230,11 @@ def main():
                         states[i]["status"] = False
                         keys = target_chat_keys(t)
                         print("[MON] UP -> DOWN:", t.get("name", "servizio"), "chat:", keys)
-                        notify(
+                        queue_transition_notification(
+                            states[i],
                             "❌ {} è OFFLINE".format(t.get("name", "servizio")),
-                            silent=silent,
-                            chat_keys=keys
+                            silent,
+                            keys
                         )
 
 
